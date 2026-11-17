@@ -8,6 +8,7 @@ import { runSync, SyncResult, SyncScope, SyncState, underPrefix } from "./sync";
 import { DEFAULT_CONFIG_SYNC, runConfigSync } from "./config-sync";
 import { GSYNC_API_VERSION, GSyncApi, GSyncFolder, TeamsExtension } from "./api";
 import { buildDriveIndex, DriveIndex, planDriveChanges } from "./drive-index";
+import { watchVaultDisk } from "./disk-watch";
 
 interface PluginData {
   settings?: Partial<GSyncSettings>;
@@ -141,6 +142,7 @@ export default class GSyncPlugin extends Plugin {
 
     this.app.workspace.onLayoutReady(() => {
       this.layoutReady = true;
+      this.watchDesktopVault();
       const resumeMobile = Platform.isMobile && this.settings.syncOnChanges &&
         (this.pendingPaths.size > 0 || this.forceFull || (this.interruptedLastTime && this.settings.syncOnStartup));
       if (resumeMobile) {
@@ -269,10 +271,35 @@ export default class GSyncPlugin extends Plugin {
     const visible = (path: string) => !underPrefix(path, this.app.vault.configDir) && !path.split("/").some(part => part.startsWith("."));
     const paths = [file.path, oldPath].filter((path): path is string => path !== undefined && visible(path));
     if (!paths.length) return;
-    if (file instanceof TFile) for (const path of paths) this.pendingPaths.add(path);
-    else this.forceFull = true;
+    if (file instanceof TFile) {
+      for (const path of paths) this.pendingPaths.add(path);
+    } else this.forceFull = true;
     if (Platform.isMobile && this.layoutReady && this.settings.syncOnChanges) this.persistMobileQueue();
     if (!this.syncing) this.queueSync();
+  }
+
+  private watchDesktopVault() {
+    if (!Platform.isDesktopApp) return;
+    const adapter = this.app.vault.adapter as { getBasePath?: () => string };
+    if (!adapter.getBasePath) return;
+    let reported = false;
+    const onError = (error: unknown) => {
+      if (reported) return;
+      reported = true;
+      console.warn('[gdsync] vault disk watcher', error);
+      new Notice('Could not watch some disk changes. Obsidian file events still work.');
+    };
+    try {
+      const close = watchVaultDisk(adapter.getBasePath(),
+        path => !underPrefix(path, this.app.vault.configDir) && !path.split('/').some(part => part.startsWith('.')),
+        path => {
+          this.pendingPaths.add(path);
+          if (!this.syncing) this.queueSync();
+        }, onError);
+      this.register(close);
+    } catch (error) {
+      onError(error);
+    }
   }
 
   private persistMobileQueue() {
@@ -435,7 +462,10 @@ export default class GSyncPlugin extends Plugin {
         const cursor = delta && feed ? feed.cursor : indexed ? await this.drive.changeCursor() : undefined;
         const tree = delta ? delta.tree : await this.drive.listTree(rootId);
         applying = true;
-        const result = await runSync(this.app, this.drive, s, state, hooks, scope, { tree, paths: delta ? delta.affected : undefined });
+        const result = await runSync(this.app, this.drive, s, state, hooks, scope, {
+          tree, paths: delta ? delta.affected : undefined,
+          diskPaths: Platform.isDesktopApp ? new Set([...localPaths].map(path => prefix ? `${prefix}/${path}` : path)) : undefined,
+        });
         add(result);
         if (!cursor || result.errors.length || tree.warnings.length) {
           delete this.driveIndexes[job.id];

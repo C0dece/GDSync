@@ -169,6 +169,8 @@ Start a sync with any of:
 | Transfer chunk size (MiB) | `16` | Android only: how much is sent or received per request. Lower it if a phone runs low on memory. |
 | Sync settings and plugins | Off | Settings sync (see below). |
 
+On desktop, GDSync also watches the vault folder while Obsidian is running. Files created or edited directly on disk, including by external editors and AI tools, enter the same queue. Enable **Sync on changes** to send them automatically.
+
 ### More folders
 
 Each extra folder pair links one **vault folder** with one **Drive folder**:

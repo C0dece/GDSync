@@ -16,6 +16,10 @@ export interface SyncRecord {
   localSize: number;
 }
 export type SyncState = Record<string, SyncRecord>;
+interface LocalEntry {
+  stat: Pick<TFile["stat"], "mtime" | "size">;
+  file?: TFile;
+}
 
 export interface SyncResult {
   uploaded: number;
@@ -103,7 +107,7 @@ export async function runSync(
   state: SyncState,
   hooks: SyncHooks,
   scope: SyncScope = { localPrefix: "", remotePath: settings.remoteFolder, otherPrefixes: [], readOnly: false },
-  input?: { tree: RemoteTree; paths?: Iterable<string> },
+  input?: { tree: RemoteTree; paths?: Iterable<string>; diskPaths?: ReadonlySet<string> },
 ): Promise<SyncResult> {
   const vault = app.vault;
   const res: SyncResult = { uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: [], errors: [], warnings: [], skipped: [], readOnlyKept: [] };
@@ -177,9 +181,10 @@ export async function runSync(
     }
   };
 
-  const writeLocal = async (path: string, data: ArrayBuffer) => {
+  const writeLocal = async (path: string, data: ArrayBuffer, hadLocal = false) => {
     const existing = vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) await vault.modifyBinary(existing, data);
+    else if (hadLocal) await vault.adapter.writeBinary(path, data);
     else {
       await ensureLocalParent(path);
       await vault.createBinary(path, data);
@@ -213,7 +218,7 @@ export async function runSync(
       const data = await drive.download(remote.id);
       hooks.transfer?.({ phase: "install", path });
       await assertLocalUnchanged(vault.adapter, path, expected, "install");
-      return writeLocal(path, data);
+      return writeLocal(path, data, hadLocal);
     }
     const staged = await android.stage(downloading(path, remote));
     try {
@@ -227,11 +232,9 @@ export async function runSync(
     if (scope.readOnly) throw new Error("Read-only folder: uploads are not allowed");
     if (!android) {
       hooks.transfer?.({ phase: "upload", path });
-      const file = vault.getAbstractFileByPath(path);
-      if (!(file instanceof TFile)) throw new Error("Local file missing");
       const expected = await vault.adapter.stat(path);
       if (!expected || expected.type !== "file") throw new Error("Local file missing");
-      const data = await vault.readBinary(file);
+      const data = await readLocal(path);
       await assertLocalUnchanged(vault.adapter, path, expected, "upload");
       verifiedUploads.set(path, expected);
       if (!remoteId) return uploadNew(path, data);
@@ -254,7 +257,17 @@ export async function runSync(
     return uploaded;
   };
 
-  const localChangedSince = (f: TFile, s: SyncRecord) => f.stat.mtime !== s.localMtime || f.stat.size !== s.localSize;
+  const readLocal = (path: string) => {
+    const file = vault.getAbstractFileByPath(path);
+    return file instanceof TFile && !input?.diskPaths?.has(path)
+      ? vault.readBinary(file)
+      : vault.adapter.readBinary(path);
+  };
+  const localChangedSince = (f: LocalEntry, s: SyncRecord) => f.stat.mtime !== s.localMtime || f.stat.size !== s.localSize;
+  const trashLocal = (entry: LocalEntry) => {
+    if (!entry.file) throw new Error("Local file is not yet indexed by Obsidian; retry sync");
+    return app.fileManager.trashFile(entry.file);
+  };
 
   /** A path that is free both here and in Drive, next to `path`. */
   const freeCopyPath = async (path: string, label: string): Promise<string> => {
@@ -271,7 +284,7 @@ export async function runSync(
    * Read-only folder: Drive is the source of truth. A local edit is kept as a
    * "(local edit …)" copy next to the file, then the Drive version is restored.
    */
-  const restoreFromDrive = async (path: string, l: TFile | undefined, r: RemoteFile) => {
+  const restoreFromDrive = async (path: string, l: LocalEntry | undefined, r: RemoteFile) => {
     if (l) {
       const copy = await freeCopyPath(path, "local edit");
       await vault.adapter.copy(path, copy);
@@ -282,7 +295,7 @@ export async function runSync(
     res.downloaded++;
   };
 
-  const syncReadOnly = async (path: string, l: TFile | undefined, r: RemoteFile | undefined, s: SyncRecord | undefined) => {
+  const syncReadOnly = async (path: string, l: LocalEntry | undefined, r: RemoteFile | undefined, s: SyncRecord | undefined) => {
     if (l && r) {
       const lChanged = !s || localChangedSince(l, s);
       const rChanged = !s || rev(r) !== s.remoteRev || r.id !== s.remoteId;
@@ -296,7 +309,7 @@ export async function runSync(
       else { await downloadLocal(path, r, true); await record(path, r); res.downloaded++; }
     } else if (l && !r) {
       if (s && settings.propagateDeletes && !localChangedSince(l, s)) {
-        await app.fileManager.trashFile(l); // removed in Drive -> remove here
+        await trashLocal(l); // removed in Drive -> remove here
         delete state[path];
         res.deletedLocal++;
       } else {
@@ -312,7 +325,7 @@ export async function runSync(
     }
   };
 
-  const resolveBothChanged = async (path: string, l: TFile, r: RemoteFile) => {
+  const resolveBothChanged = async (path: string, r: RemoteFile) => {
     const expected = android ? await androidSnapshot(path) : await vault.adapter.stat(path);
     if (!expected || expected.type !== "file") throw new Error("Local file missing during comparison");
     // Only compare files already matched by their full vault-relative path.
@@ -355,7 +368,7 @@ export async function runSync(
       } finally { await staged.dispose(); }
     }
     hooks.transfer?.({ phase: equal === undefined ? "compare" : "download", path });
-    const [ld, rd] = await Promise.all([vault.readBinary(l), drive.download(r.id)]);
+    const [ld, rd] = await Promise.all([readLocal(path), drive.download(r.id)]);
     await assertLocalUnchanged(vault.adapter, path, expected);
     if (equal === undefined && sameBytes(ld, rd)) {
       await record(path, r, expected);
@@ -378,7 +391,7 @@ export async function runSync(
   // ---- main pass ----------------------------------------------------------
   const paths = input?.paths
     ? [...new Set([...input.paths].map(toVault).filter(inScope))].sort()
-    : Array.from(new Set([...local.keys(), ...[...remote.keys()].filter(inScope), ...Object.keys(state).filter(inScope)])).sort();
+    : [...new Set([...local.keys(), ...remote.keys(), ...Object.keys(state), ...(input?.diskPaths ?? [])])].filter(inScope).sort();
 
   const work = () => res.uploaded + res.downloaded + res.deletedLocal + res.deletedRemote + res.conflicts.length;
   let lastCheckpointWork = 0;
@@ -400,7 +413,12 @@ export async function runSync(
       continue;
     }
     try {
-      const l = local.get(path);
+      const file = local.get(path);
+      let l: LocalEntry | undefined = file && { file, stat: file.stat };
+      if (input?.diskPaths?.has(path)) {
+        const stat = await vault.adapter.stat(path);
+        l = stat?.type === "file" ? { file, stat } : undefined;
+      }
       const r = remote.get(path);
       if (maxBytes > 0 && ((l && l.stat.size > maxBytes) || (r && Number(r.size ?? 0) > maxBytes))) {
         res.skipped.push(path);
@@ -415,12 +433,12 @@ export async function runSync(
 
       if (l && r) {
         if (!s) {
-          await resolveBothChanged(path, l, r); // first time we've seen both: compare contents
+          await resolveBothChanged(path, r); // first time we've seen both: compare contents
           continue;
         }
         const lChanged = localChangedSince(l, s);
         const rChanged = rev(r) !== s.remoteRev || r.id !== s.remoteId;
-        if (lChanged && rChanged) await resolveBothChanged(path, l, r);
+        if (lChanged && rChanged) await resolveBothChanged(path, r);
         else if (lChanged) {
           const updated = await uploadLocal(path, r.id);
           await record(path, updated);
@@ -432,7 +450,7 @@ export async function runSync(
         }
       } else if (l && !r) {
         if (s && settings.propagateDeletes && !localChangedSince(l, s)) {
-          await app.fileManager.trashFile(l); // deleted in Drive -> delete here
+          await trashLocal(l); // deleted in Drive -> delete here
           delete state[path];
           res.deletedLocal++;
         } else {

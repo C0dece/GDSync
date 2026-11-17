@@ -175,6 +175,30 @@ test('file moves queue the old and new paths while folder changes require a full
   }], []), null);
 });
 
+test('direct disk edits upload with stale Obsidian metadata and new unindexed files upload in delta and full sync', async () => {
+  for (const full of [false, true]) {
+    const v = fakeVault({ 'note.md': 'old' });
+    const d = fakeDrive({ 'Notes/note.md': 'old' });
+    const state: SyncState = {};
+    const tree = await d.drive.listTree('Notes');
+    assert.deepEqual((await runSync(v.app as any, d.drive as any, settings, state, hooks, undefined, { tree })).errors, []);
+    const stale = v.app.vault.getFiles();
+    v.app.vault.getFiles = () => stale;
+    v.app.vault.getAbstractFileByPath = path => stale.find(file => file.path === path) ?? null;
+    v.app.vault.readBinary = async () => assert.fail('external changes must be read from disk');
+    v.put('note.md', 'new'); // Same length, fresh mtime.
+    v.put('Nested/created.md', 'created outside Obsidian');
+    const diskPaths = new Set(['note.md', 'Nested/created.md']);
+    const result = await runSync(v.app as any, d.drive as any, settings, state, hooks, undefined, {
+      tree, paths: full ? undefined : diskPaths, diskPaths,
+    });
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.uploaded, 2);
+    assert.equal(d.text('Notes/note.md'), 'new');
+    assert.equal(d.text('Notes/Nested/created.md'), 'created outside Obsidian');
+  }
+});
+
 // ---- folder pairs ----------------------------------------------------------
 
 test('whole-vault folder leaves other pairs\' vault folders alone, in both directions', async () => {
