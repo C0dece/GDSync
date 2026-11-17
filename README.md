@@ -234,7 +234,8 @@ GDSync remembers what each file looked like on both sides at the last sync:
 **Limitations**
 - Renames sync as a delete plus a new file.
 - Empty folders aren't synced.
-- Google Docs/Sheets/Slides in the Drive folder are ignored.
+- Regular files, including Office documents, PDFs, and attachments, sync in both directions.
+- Google Docs, Sheets, Slides, Drawings, and Apps Script are imported from Drive as Markdown, XLSX, PPTX, PDF, and JSON respectively. The local filename includes the Google file ID to distinguish the export from regular files. A newer Drive version refreshes the export, saving any local edits as a separate copy. The plugin does not rewrite or trash the Google original. Google limits exports to 10 MB. Workspace types without a supported export, such as Forms or Sites, and Drive shortcuts are skipped.
 - Hidden files and folders (names starting with `.`) are never synced.
 - Sync runs only while Obsidian is open and in the foreground.
 

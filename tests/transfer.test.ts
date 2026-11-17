@@ -141,6 +141,26 @@ async function syncFixture(initial?: Uint8Array) {
 }
 const settings={remoteFolder:'root',maxFileSizeMB:0,excludes:'',propagateDeletes:false} as any;
 const hooks={checkpoint:async()=>{},progress:()=>{}};
+test('Android installs Workspace exports through the bounded staging path', async () => {
+ const f = await syncFixture();
+ const doc = { id: 'native', name: 'note', mimeType: 'application/vnd.google-apps.document', version: '1', modifiedTime: 'date' };
+ const path = 'note (Google native).md';
+ const drive = {
+  ...f.drive,
+  listTree: async () => ({ files: new Map([[path, doc]]), folders: new Map([['', 'root']]), warnings: [] }),
+  getFile: async () => doc,
+  exportWorkspaceFile: async () => bytes.buffer,
+ };
+ try {
+  const state: any = {};
+  const result = await runSync({ vault: f.vault } as any, drive as any, settings, state, hooks);
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.downloaded, 1);
+  assert.deepEqual(f.adapter.files.get(path), bytes);
+  assert.equal(f.adapter.maxAppend, chunkSize);
+  assert.ok(state[path].workspaceDigest);
+ } finally { f.restore(); }
+});
 test('Android accepts metadata-only changes to the staged source during installation',async()=>{
  const f=await syncFixture();const copy=f.adapter.copy.bind(f.adapter);
  f.adapter.copy=async(a,b)=>{await copy(a,b);if(a.endsWith('/data'))f.adapter.times.set(a,(f.adapter.times.get(a)??0)+1);};

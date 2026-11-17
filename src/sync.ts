@@ -5,8 +5,9 @@ import type { TransferProgress } from "./progress";
 import { AndroidFiles } from "./android-files";
 import { transferChunkBytes } from "./transfer-settings";
 import { assertLocalUnchanged, sameStat, Snapshot } from "./local-files";
-import { hashLocalFile, validSha256 } from "./checksum";
+import { hashLocalFile, sha256Bytes, validSha256 } from "./checksum";
 import { sameRemoteVersion } from "./remote-metadata";
+import { workspaceFormat } from "./workspace-files";
 
 /** What both sides looked like the last time this path was in sync. */
 export interface SyncRecord {
@@ -14,6 +15,7 @@ export interface SyncRecord {
   remoteRev: string;
   localMtime: number;
   localSize: number;
+  workspaceDigest?: string;
 }
 export type SyncState = Record<string, SyncRecord>;
 interface LocalEntry {
@@ -280,6 +282,49 @@ export async function runSync(
     return c;
   };
 
+  const syncWorkspace = async (path: string, remote: RemoteFile, previous?: SyncRecord) => {
+    const revision = remote.version ?? remote.modifiedTime;
+    const before = await vault.adapter.stat(path);
+    if (before && before.type !== 'file') throw new Error('Workspace export destination is a folder');
+    if (maxBytes > 0 && before && before.size > maxBytes) { res.skipped.push(path); return; }
+    const tracked = previous?.remoteId === remote.id && previous.workspaceDigest;
+    if (before && tracked && previous.remoteRev === revision) return;
+    hooks.transfer?.({ phase: 'download', path });
+    if (!sameRemoteVersion(remote, await drive.getFile(remote.id))) throw new Error('Google document changed before export; retry sync');
+    const data = await drive.exportWorkspaceFile(remote);
+    if (!sameRemoteVersion(remote, await drive.getFile(remote.id))) throw new Error('Google document changed during export; retry sync');
+    if (maxBytes > 0 && data.byteLength > maxBytes) { res.skipped.push(path); return; }
+
+    const digest = sha256Bytes(data);
+    const oldDigest = before && (android ? await hashLocalFile(vault.adapter, path) : sha256Bytes(await readLocal(path)));
+    await assertLocalUnchanged(vault.adapter, path, before, 'workspace-export');
+    if (before && oldDigest !== digest && oldDigest !== tracked) {
+      const copy = await freeCopyPath(path, 'local edit');
+      await vault.adapter.copy(path, copy);
+      await assertLocalUnchanged(vault.adapter, path, before, 'workspace-backup');
+      res.readOnlyKept.push(copy);
+    }
+    if (oldDigest !== digest) {
+      hooks.transfer?.({ phase: 'install', path });
+      if (android) {
+        async function* chunks() {
+          const size = transferChunkBytes(1);
+          for (let offset = 0; offset < data.byteLength; offset += size) yield data.slice(offset, offset + size);
+        }
+        const staged = await android.stage(chunks());
+        try { await staged.install(path, before && { ...before, sha256: oldDigest || undefined }); }
+        finally { await staged.dispose(); }
+      } else {
+        await assertLocalUnchanged(vault.adapter, path, before, 'workspace-install');
+        await writeLocal(path, data, !!before);
+      }
+      res.downloaded++;
+    }
+    const saved = await vault.adapter.stat(path);
+    if (!saved || saved.type !== 'file' || saved.size !== data.byteLength) throw new Error('Incomplete Workspace export');
+    state[path] = { remoteId: remote.id, remoteRev: revision, localMtime: saved.mtime, localSize: saved.size, workspaceDigest: digest };
+  };
+
   /**
    * Read-only folder: Drive is the source of truth. A local edit is kept as a
    * "(local edit …)" copy next to the file, then the Drive version is restored.
@@ -420,11 +465,20 @@ export async function runSync(
         l = stat?.type === "file" ? { file, stat } : undefined;
       }
       const r = remote.get(path);
+      let s: SyncRecord | undefined = state[path];
+      if (r && workspaceFormat(r)) {
+        await syncWorkspace(path, r, s);
+        continue;
+      }
+      if (s?.workspaceDigest) {
+        if (!r) continue; // Retain exported copies when the source is removed or moved.
+        if (l) throw new Error('A regular Drive file uses this export path; move the local export to sync both');
+        s = undefined;
+      }
       if (maxBytes > 0 && ((l && l.stat.size > maxBytes) || (r && Number(r.size ?? 0) > maxBytes))) {
         res.skipped.push(path);
         continue;
       }
-      const s = state[path];
 
       if (scope.readOnly) {
         await syncReadOnly(path, l, r, s);

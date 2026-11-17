@@ -2,6 +2,7 @@ import { requestUrl, RequestUrlResponse } from "obsidian";
 
 import { downloadChunks, uploadChunks, BinarySource, ByteProgress } from "./drive-transfer";
 import { DRIVE_FILE_FIELDS as FIELDS } from "./remote-metadata";
+import { syncFileName, workspaceFormat } from "./workspace-files";
 
 const API = "https://www.googleapis.com/drive/v3";
 const UPLOAD = "https://www.googleapis.com/upload/drive/v3";
@@ -214,7 +215,7 @@ export class DriveClient {
     return { canEdit: c.canAddChildren !== false && c.canEdit !== false, inSharedDrive: !!f.driveId, canShare: !!c.canShare };
   }
 
-  async listTree(rootId: string): Promise<RemoteTree> {
+  async listTree(rootId: string, includeWorkspace = true): Promise<RemoteTree> {
     const files = new Map<string, RemoteFile>();
     const folders = new Map<string, string>([["", rootId]]);
     const warnings: string[] = [];
@@ -225,7 +226,10 @@ export class DriveClient {
         // Hidden files and folders (.obsidian, .git, .trash ...) are never part of note sync,
         // so don't spend requests walking them. Settings sync lists the config folder itself.
         if (f.name.startsWith(".")) continue;
-        const path = prefix ? `${prefix}/${f.name}` : f.name;
+        if (!includeWorkspace && workspaceFormat(f)) continue;
+        const name = f.mimeType === FOLDER_MIME ? f.name : syncFileName(f);
+        if (!name) continue;
+        const path = prefix ? `${prefix}/${name}` : name;
         if (f.mimeType === FOLDER_MIME) {
           const driveId = this.driveOf.get(id);
           if (driveId) this.driveOf.set(f.id, driveId);
@@ -233,10 +237,9 @@ export class DriveClient {
             folders.set(path, f.id);
             queue.push([path, f.id]);
           } else warnings.push(`Duplicate folder in Drive: ${path}`);
-        } else if (f.mimeType.startsWith("application/vnd.google-apps.")) {
-          continue; // Google Docs/Sheets etc. can't be downloaded as files
         } else if (files.has(path)) {
           warnings.push(`Duplicate name in Drive, ignoring extra copy: ${path}`);
+          if (workspaceFormat(files.get(path)!) && !workspaceFormat(f)) files.set(path, f);
         } else {
           files.set(path, f);
         }
@@ -289,6 +292,13 @@ export class DriveClient {
   async download(id: string): Promise<ArrayBuffer> {
     const r = await this.req(`${API}/files/${id}?alt=media`);
     return r.arrayBuffer;
+  }
+
+  async exportWorkspaceFile(file: RemoteFile): Promise<ArrayBuffer> {
+    const format = workspaceFormat(file);
+    if (!format) throw new Error("This Google Workspace format cannot be exported");
+    const url = `${API}/files/${encodeURIComponent(file.id)}/export?mimeType=${encodeURIComponent(format.mimeType)}`;
+    return (await this.req(url)).arrayBuffer;
   }
 
   async createFile(name: string, parentId: string, data: ArrayBuffer): Promise<RemoteFile> {

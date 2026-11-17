@@ -436,7 +436,7 @@ export default class GSyncPlugin extends Plugin {
         this.access.set(job.id, access);
         const scope = { ...job.scope, readOnly: !access.canEdit };
         const state = job.state();
-        const key = JSON.stringify([rootId, scope, s.excludes, s.maxFileSizeMB, s.propagateDeletes, this.app.vault.configDir]);
+        const key = JSON.stringify([2, rootId, scope, s.excludes, s.maxFileSizeMB, s.propagateDeletes, this.app.vault.configDir]);
         const indexed = rootId !== "root" && !access.inSharedDrive;
         const index = this.driveIndexes[job.id];
         const prefix = scope.localPrefix;
@@ -548,7 +548,7 @@ export default class GSyncPlugin extends Plugin {
         new Notice(`${r.errors.length} file(s) failed to sync. First: ${r.errors[0]}`, 15000);
       }
       if (r.readOnlyKept.length) {
-        new Notice(`${r.readOnlyKept.length} change(s) in view-only folders stayed on this device (edits are kept as "(local edit …)" copies):\n${r.readOnlyKept.slice(0, 5).join("\n")}`, 15000);
+        new Notice(`Local changes preserved at ${r.readOnlyKept.length} path(s):\n${r.readOnlyKept.slice(0, 5).join("\n")}`, 15000);
       }
       if (r.needsRestart) {
         new Notice("GDSync: settings or plugins arrived from another device. Restart Obsidian to apply them.", 0);

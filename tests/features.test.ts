@@ -5,6 +5,7 @@ import { runSync, SyncState } from '../src/sync';
 import { configCategory, DEFAULT_CONFIG_SYNC, mergePluginLists, localPlugins, runConfigSync } from '../src/config-sync';
 import { DriveClient, FOLDER_MIME, isSharedDrivePath, withAllDrives } from '../src/drive';
 import { buildDriveIndex, planDriveChanges } from '../src/drive-index';
+import { syncFileName } from '../src/workspace-files';
 
 // These tests cover the desktop/iOS code path; Android transfers are covered in transfer.test.ts.
 (Platform as { isAndroidApp: boolean }).isAndroidApp = false;
@@ -134,6 +135,95 @@ function fakeDrive(initial: Record<string, string>) {
 
 const settings = { remoteFolder: 'Notes', maxFileSizeMB: 0, excludes: '', propagateDeletes: true, transferChunkSizeMiB: 16 } as any;
 const hooks = { checkpoint: async () => {}, progress: () => {} };
+
+test('full listing and change feed agree on the projected Workspace paths and exports', async () => {
+  const docs = [
+    ['document', '.md', 'text/markdown'],
+    ['spreadsheet', '.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+    ['presentation', '.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+    ['drawing', '.pdf', 'application/pdf'],
+  ].map(([kind, extension, mimeType]) => ({
+    file: { id: kind, name: 'тест' + extension, mimeType: 'application/vnd.google-apps.' + kind, modifiedTime: 'date' },
+    name: `тест (Google ${kind})${extension}`, mimeType,
+  }));
+  (globalThis as any).requestUrlMock = async ({ url }: { url: string }) => {
+    const request = new URL(url);
+    if (request.pathname.endsWith('/export')) {
+      const doc = docs.find(doc => request.pathname.includes(`/${doc.file.id}/`))!;
+      assert.equal(request.searchParams.get('mimeType'), doc.mimeType);
+      return { status: 200, arrayBuffer: enc(doc.name).buffer };
+    }
+    return { status: 200, json: { files: docs.map(doc => doc.file) } };
+  };
+  const drive = new DriveClient(async () => 'fake');
+  const listed = await drive.listTree('root');
+  assert.deepEqual([...listed.files.keys()], docs.map(doc => doc.name));
+  const index = buildDriveIndex('key', 'before', { ...listed, files: new Map() });
+  const delta = planDriveChanges(index, docs.map(({ file }) => ({ fileId: file.id, file: { ...file, parents: ['root'] } })), [])!;
+  assert.deepEqual([...delta.tree.files.keys()], [...listed.files.keys()]);
+  for (const doc of docs) assert.equal(dec(await drive.exportWorkspaceFile(doc.file)), doc.name);
+});
+
+test('Workspace exports preserve local edits and never change or delete the Google original', async () => {
+  const v = fakeVault({});
+  const d = fakeDrive({});
+  const metadata = { id: 'doc', name: 'тест.md', mimeType: 'application/vnd.google-apps.document', version: '1', modifiedTime: 'date' };
+  const path = syncFileName(metadata)!;
+  let contents = 'Google version';
+  let exports = 0;
+  let files = new Map([[path, metadata]]);
+  const drive = {
+    ...d.drive,
+    listTree: async () => ({
+      files: new Map([...files].map(([name, file]) => [name, { ...file }])),
+      folders: new Map([['', 'Notes']]),
+      warnings: [],
+    }),
+    getFile: async () => ({ ...metadata }),
+    exportWorkspaceFile: async () => { exports++; return enc(contents).buffer; },
+  };
+  const state: SyncState = {};
+  const sync = () => runSync(v.app as any, drive as any, settings, state, hooks);
+  assert.equal((await sync()).downloaded, 1);
+  assert.equal(v.text(path), contents);
+  v.put(path, 'local edit');
+  assert.deepEqual((await sync()).errors, []);
+  assert.equal(exports, 1);
+  assert.equal(v.text(path), 'local edit');
+  metadata.version = '2';
+  contents = 'Google update';
+  const result = await sync();
+  assert.deepEqual(result.errors, []);
+  assert.equal(v.text(path), contents);
+  const backup = [...v.data.keys()].find(key => key.includes('(local edit'));
+  assert.deepEqual(result.readOnlyKept, [backup]);
+  assert.equal(v.text(backup!), 'local edit');
+  v.data.delete(backup!);
+  metadata.version = '3';
+  drive.exportWorkspaceFile = async () => {
+    metadata.version = '4';
+    return enc('unstable export').buffer;
+  };
+  assert.match((await sync()).errors[0], /changed during export/);
+  assert.equal(state[path].remoteRev, '2');
+  assert.equal(v.text(path), contents);
+  files = new Map();
+  assert.deepEqual((await sync()).errors, []);
+  assert.equal(v.text(path), contents);
+  assert.deepEqual(d.calls, { uploads: [], trashed: [] });
+});
+
+test('regular Office and PDF files are still transferred in both directions', async () => {
+  const v = fakeVault({ 'office.docx': 'binary office data' });
+  const d = fakeDrive({ 'Notes/document.pdf': 'binary pdf data' });
+  const state: SyncState = {};
+  const result = await runSync(v.app as any, d.drive as any, settings, state, hooks);
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.uploaded, 1);
+  assert.equal(result.downloaded, 1);
+  assert.equal(d.text('Notes/office.docx'), 'binary office data');
+  assert.equal(v.text('document.pdf'), 'binary pdf data');
+});
 
 test('the incremental queue uploads a local edit and downloads a Drive edit without enumerating the vault', async () => {
   const v = fakeVault({ 'local.md': 'local', 'remote.md': 'remote', 'untouched.md': 'old' });

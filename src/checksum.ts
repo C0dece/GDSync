@@ -6,6 +6,10 @@ export function validSha256(value: unknown): value is string {
   return typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value);
 }
 
+export function sha256Bytes(data: ArrayBuffer): string {
+    return Array.from(sha256(new Uint8Array(data)), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
 /** Incremental hashing: never materialize the whole file or call readBinary. */
 export async function hashLocalFile(adapter: DataAdapter, path: string, onProgress?: (bytes: number) => void): Promise<string> {
   const hash = sha256.create();

@@ -1,4 +1,5 @@
 import { FOLDER_MIME, type DriveChange, type RemoteFile, type RemoteTree } from "./drive";
+import { syncFileName } from "./workspace-files";
 
 export interface DriveIndex {
   key: string;
@@ -38,10 +39,12 @@ export function planDriveChanges(index: DriveIndex, changes: DriveChange[], loca
       affected.add(oldPath);
       updates.set(oldPath, null);
     }
-    if (!file || !parents.length || file.name.startsWith(".") || file.mimeType.startsWith("application/vnd.google-apps.")) continue;
-    if (parents.length > 1 || !file.name || /[/\\]/.test(file.name)) return null;
+    if (!file || !parents.length) continue;
+    const name = syncFileName(file);
+    if (!name) continue;
+    if (parents.length > 1 || /[/\\]/.test(name)) return null;
     const parent = foldersById.get(parents[0])!;
-    const path = parent ? `${parent}/${file.name}` : file.name;
+    const path = parent ? `${parent}/${name}` : name;
     const existing = updates.get(path) ?? (Object.prototype.hasOwnProperty.call(index.files, path) ? index.files[path] : undefined);
     if (existing && existing.id !== id) return null;
     affected.add(path);

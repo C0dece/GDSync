@@ -150,7 +150,7 @@ export async function runConfigSync(
   const configDir = app.vault.configDir;
   const res: ConfigSyncResult = { uploaded: 0, downloaded: 0, deleted: 0, errors: [], needsRestart: false };
   const rootId = await drive.ensureChildFolder(mainRootId, configDir);
-  const tree = await drive.listTree(rootId);
+  const tree = await drive.listTree(rootId, false);
   const local = new Set((await listLocal(adapter, configDir)).filter((rel) => configCategory(rel, cfg)));
   const remote = new Map([...tree.files].filter(([rel]) => configCategory(rel, cfg)));
   const keepLocal = localPlugins(cfg);
