@@ -2,7 +2,7 @@ import type { RequestUrlResponse } from "obsidian";
 import type { FolderAccess } from "./drive";
 
 /**
- * GSync's interface for add-ons such as GSync Teams.
+ * GDSync's interface for add-ons such as GSync Teams.
  * An add-on gets it with `app.plugins.getPlugin("gsync")?.api` and checks `version`.
  * Bump GSYNC_API_VERSION only for breaking changes; adding members is not breaking.
  */
@@ -35,13 +35,13 @@ export interface TeamsExtension {
 
 export interface GSyncApi {
   version: number;
-  /** Authorized Google Drive API request, using GSync's sign-in. */
+  /** Authorized Google Drive API request, using GDSync's sign-in. */
   request(url: string, opts?: DriveRequestOptions): Promise<RequestUrlResponse>;
   /** Resolve (and create if missing) a Drive folder path to its id. */
   ensureFolderPath(path: string): Promise<string>;
   /** What the signed-in user may do in a Drive folder. */
   folderAccess(folderId: string): Promise<FolderAccess>;
-  /** The folders GSync syncs, whole vault first. */
+  /** The folders GDSync syncs, whole vault first. */
   folders(): GSyncFolder[];
   /** Register the Teams add-on. Returns a function that unregisters it. */
   registerTeams(ext: TeamsExtension): () => void;

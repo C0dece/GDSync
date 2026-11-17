@@ -1,5 +1,5 @@
 export interface TransferProgress {
-  phase: 'download' | 'upload' | 'compare' | 'install' | 'hash';
+  phase: 'download' | 'upload' | 'compare' | 'install' | 'hash' | 'snapshot' | 'folder' | 'access' | 'listing' | 'recovery';
   path: string;
   bytes?: number;
   total?: number;
@@ -25,12 +25,12 @@ export class SyncProgress {
     return changed;
   }
   text(): string {
-    const lines = [this.total ? `GSync: ${this.done}/${this.total} files checked` : 'GSync: preparing sync…'];
+    const lines = [this.total ? `GDSync: ${this.done}/${this.total} files checked` : 'GDSync: preparing sync…'];
     const p = this.current;
     if (!p) return lines[0];
-    const label = { download: '↓ Downloading', upload: '↑ Uploading', compare: 'Comparing', install: 'Saving', hash: 'Hashing' }[p.phase];
+    const label = { download: '↓ Downloading', upload: '↑ Uploading', compare: 'Comparing', install: 'Saving', hash: 'Hashing', snapshot: 'Reading local file', folder: 'Finding Drive folder', access: 'Checking Drive access', listing: 'Listing Drive files', recovery: 'Checking previous transfers' }[p.phase];
     lines.push(`${label}: ${p.path}`);
-    if ((p.phase === 'download' || p.phase === 'upload' || p.phase === 'hash') && p.bytes !== undefined && p.total !== undefined && Number.isFinite(p.bytes) && Number.isFinite(p.total) && p.total >= 0) {
+    if ((p.phase === 'download' || p.phase === 'upload' || p.phase === 'hash' || p.phase === 'snapshot') && p.bytes !== undefined && p.total !== undefined && Number.isFinite(p.bytes) && Number.isFinite(p.total) && p.total >= 0) {
       const percent = p.total ? Math.min(100, Math.floor(p.bytes * 100 / p.total)) : 100;
       let detail = `${mib(p.bytes)} / ${mib(p.total)} MiB · ${percent}%`;
       const seconds = (this.now() - this.started) / 1000;

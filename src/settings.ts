@@ -16,8 +16,6 @@ export interface FolderPair {
 
 export const cleanPath = (v: string) => v.trim().replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/^\/+|\/+$/g, "");
 
-const DONATE_URL = "https://www.paypal.com/donate/?hosted_button_id=N8NVQRB353E2G";
-
 export interface GSyncSettings {
   clientId: string;
   clientSecret: string;
@@ -25,6 +23,8 @@ export interface GSyncSettings {
   redirectUri: string;
   remoteFolder: string;
   autoSyncMinutes: number;
+  syncOnChanges: boolean;
+  showSyncNotifications: boolean;
   syncOnStartup: boolean;
   propagateDeletes: boolean;
   excludes: string;
@@ -42,6 +42,8 @@ export const DEFAULT_SETTINGS: GSyncSettings = {
   redirectUri: DEFAULT_REDIRECT,
   remoteFolder: "",
   autoSyncMinutes: 10,
+  syncOnChanges: false,
+  showSyncNotifications: true,
   syncOnStartup: true,
   propagateDeletes: true,
   excludes: "# One rule per line. Hidden files/folders and the vault config folder are always skipped.\n# Examples:  Templates/   *.tmp   desktop.ini\ndesktop.ini\nThumbs.db\n",
@@ -149,7 +151,7 @@ export class GSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Sync now")
-      .setDesc("Also available from the ribbon icon and the command palette (\"GSync: Sync now\").")
+      .setDesc("Also available from the ribbon icon and the command palette (\"GDSync: Sync now\").")
       .addButton((b) =>
         b
           .setButtonText("Sync now")
@@ -233,6 +235,22 @@ export class GSyncSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(containerEl)
+      .setName("Sync on changes")
+      .setDesc("Sync after local edits and when returning to Obsidian. Replaces the sync interval.")
+      .addToggle(t => t.setValue(s.syncOnChanges).onChange(async value => {
+        s.syncOnChanges = value;
+        this.plugin.scheduleAutoSync();
+        await this.plugin.saveAll();
+      }));
+    new Setting(containerEl)
+      .setName("Show sync progress notifications")
+      .setDesc("Show progress popups. The status bar and error notices remain available.")
+      .addToggle(t => t.setValue(s.showSyncNotifications).onChange(async value => {
+        s.showSyncNotifications = value;
+        this.plugin.updateProgressNotifications();
+        await this.plugin.saveAll();
+      }));
     new Setting(containerEl).setName("Sync when Obsidian starts").addToggle((t) =>
       t.setValue(s.syncOnStartup).onChange(async (v) => {
         s.syncOnStartup = v;
@@ -297,16 +315,6 @@ export class GSyncSettingTab extends PluginSettingTab {
 
     this.settingsSyncSection(containerEl);
 
-    new Setting(containerEl).setName("Support").setHeading();
-
-    new Setting(containerEl)
-      .setName("Support GSync")
-      .setDesc("GSync is free and open source. If it saves you a subscription, you can chip in to support development.")
-      .addButton((b) =>
-        b.setButtonText("Donate via PayPal").onClick(() => {
-          window.open(DONATE_URL);
-        })
-      );
   }
 
   /** Description for a folder row, including this device's access from the last sync. */
@@ -341,7 +349,7 @@ export class GSyncSettingTab extends PluginSettingTab {
       .setDesc(
         "Keeps Obsidian settings, themes and community plugins the same on every device, using the " +
           "vault's config folder inside the whole-vault Drive folder. The first time you turn this on, " +
-          "this device takes the settings already in Drive. GSync's own settings and each device's window " +
+          "this device takes the settings already in Drive. GDSync's own settings and each device's window " +
           "layout are never synced. Restart Obsidian after changes arrive."
       )
       .addToggle((t) =>

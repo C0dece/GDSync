@@ -30,7 +30,7 @@ export const DEFAULT_CONFIG_SYNC: ConfigSyncSettings = {
   excludedPlugins: "",
 };
 
-/** Plugins that must never be synced: GSync's own sign-in data and per-device state live there. */
+/** Plugins that must never be synced: GDSync's own sign-in data and per-device state live there. */
 export const ALWAYS_LOCAL_PLUGINS = ["gsync", "gdrive-vault-sync"];
 
 /** Per-device files: window layout and recent files. */
@@ -84,7 +84,7 @@ function parseIds(text: string): string[] | null {
 
 /**
  * Merge the enabled-plugin lists. Shared plugins follow `primary`; plugins kept local
- * (GSync itself and the exclude list) keep `keepLocalFrom`'s on/off state.
+ * (GDSync itself and the exclude list) keep `keepLocalFrom`'s on/off state.
  */
 export function mergePluginLists(primary: string[], keepLocalFrom: string[], local: Set<string>): string[] {
   const out = primary.filter((id) => !local.has(id));
@@ -198,7 +198,7 @@ export async function runConfigSync(
     // Drive's list wins on the first run and whenever this device didn't change its own list.
     const fromDrive = R !== null && (!s || !lChanged || L === null);
     const merged = fromDrive ? mergePluginLists(R, L ?? [], keepLocal) : mergePluginLists(L ?? [], L ?? [], keepLocal);
-    // This code runs inside GSync, so GSync is on: never let a synced list turn it off.
+    // This code runs inside GDSync, so GDSync is on: never let a synced list turn it off.
     if (!merged.includes("gsync")) merged.push("gsync");
     if (L === null || !sameSet(L, merged)) await write(rel, enc.encode(JSON.stringify(merged, null, 2)).buffer);
     // What Drive should hold: this device's shared entries, plus Drive's state for locally-kept plugins.

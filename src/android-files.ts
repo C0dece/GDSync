@@ -2,6 +2,8 @@ import type { DataAdapter } from 'obsidian';
 import type { BinarySource } from './drive-transfer';
 import { assertLocalUnchanged, LOCAL_READ_CHUNK_SIZE, readLocalChunks, Snapshot } from './local-files';
 import { MAX_TRANSFER_CHUNK_BYTES } from './transfer-settings';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { hashLocalFile } from './checksum';
 
 export interface StagedFile {
   path: string;
@@ -18,7 +20,14 @@ export class AndroidFiles {
     if (typeof adapter.appendBinary !== 'function') throw new Error('Android streaming requires Obsidian 1.12.3 or later');
   }
   assertUnchanged(path: string, expected: Snapshot): Promise<void> {
-    return assertLocalUnchanged(this.adapter, path, expected);
+    return assertLocalUnchanged(this.adapter, path, expected, 'android');
+  }
+  async snapshot(path: string, onProgress?: (bytes: number, total: number) => void): Promise<Snapshot> {
+    const stat = await this.adapter.stat(path);
+    if (!stat || stat.type !== 'file') return stat;
+    const digest = await hashLocalFile(this.adapter, path, bytes => onProgress?.(bytes, stat.size));
+    await assertLocalUnchanged(this.adapter, path, stat, 'snapshot');
+    return { type: stat.type, size: stat.size, mtime: stat.mtime, sha256: digest };
   }
   private async mkdir(path: string): Promise<void> {
     const parts = path.split('/');
@@ -27,12 +36,12 @@ export class AndroidFiles {
       if (!await this.adapter.exists(prefix)) await this.adapter.mkdir(prefix);
     }
   }
-  private async checkedCopy(source: string, target: string): Promise<void> {
+  private async checkedCopy(source: string, target: string, digest?: string): Promise<void> {
     const before = await this.adapter.stat(source);
     if (!before || before.type !== 'file') throw new Error('Copy source missing');
     await this.adapter.copy(source, target);
     if ((await this.adapter.stat(target))?.size !== before.size) throw new Error('Incomplete native file copy');
-    await this.assertUnchanged(source, before);
+    await assertLocalUnchanged(this.adapter, source, { ...before, sha256: digest }, 'native-copy-source');
   }
   readChunks(path: string, chunkSize = LOCAL_READ_CHUNK_SIZE): AsyncGenerator<ArrayBuffer> {
     return readLocalChunks(this.adapter, path, chunkSize);
@@ -58,15 +67,19 @@ export class AndroidFiles {
     const dir = `${this.root}/transfer-${crypto.randomUUID()}`;
     await this.mkdir(dir);
     const path = `${dir}/data`, backup = `${dir}/original`, journal = `${dir}/journal.json`;
+    let stagedDigest: string | undefined;
     try {
       let size = 0;
+      const hash = sha256.create();
       await this.adapter.writeBinary(path, new ArrayBuffer(0));
       for await (const chunk of chunks) {
         if (chunk.byteLength > MAX_TRANSFER_CHUNK_BYTES) throw new Error('Oversized download chunk');
         await this.adapter.appendBinary(path, chunk);
+        hash.update(new Uint8Array(chunk));
         size += chunk.byteLength;
       }
       if ((await this.adapter.stat(path))?.size !== size) throw new Error('Incomplete staged file');
+      stagedDigest = Array.from(hash.digest(), byte => byte.toString(16).padStart(2, '0')).join('');
     } catch (e) {
       await this.adapter.rmdir(dir, true).catch(() => undefined);
       throw e;
@@ -84,7 +97,7 @@ export class AndroidFiles {
         // Copying preserves the visible TFile identity; renaming it into a hidden
         // directory would emit a user-visible rename and break Vault's cache.
         if (expected) {
-          await this.checkedCopy(target, backup);
+          await this.checkedCopy(target, backup, expected.sha256);
           if ((await this.adapter.stat(backup))?.size !== expected.size) throw new Error('Incomplete backup');
           await this.assertUnchanged(target, expected);
         }
@@ -96,7 +109,7 @@ export class AndroidFiles {
         // On Android adapter.copy is native and reconciles the target after copying.
         // It is not atomic: the journal allows recovery of an interrupted copy.
         try {
-          await this.checkedCopy(path, target);
+          await this.checkedCopy(path, target, stagedDigest);
           if ((await this.adapter.stat(target))?.size !== (await this.adapter.stat(path))?.size) throw new Error('Incomplete installed file');
           await this.adapter.remove(journal);
         } catch (e) {

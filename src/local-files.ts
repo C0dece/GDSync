@@ -2,14 +2,25 @@ import type { DataAdapter, Stat } from 'obsidian';
 import { assertTransferChunkBytes } from './transfer-settings';
 
 export const LOCAL_READ_CHUNK_SIZE = 1024 * 1024;
-export type Snapshot = Pick<Stat, 'size' | 'mtime' | 'type'> | null;
+export type Snapshot = (Pick<Stat, 'size' | 'mtime' | 'type'> & { sha256?: string }) | null;
 export function sameStat(a: Snapshot, b: Snapshot): boolean {
   return a === null ? b === null : b !== null && a.type === b.type && a.size === b.size && a.mtime === b.mtime;
 }
 
-export async function assertLocalUnchanged(adapter: DataAdapter, path: string, expected: Snapshot): Promise<void> {
+export async function assertLocalUnchanged(adapter: DataAdapter, path: string, expected: Snapshot, stage = 'check'): Promise<void> {
   if (expected && expected.type !== 'file') throw new Error('Destination is not a file');
-  if (!sameStat(expected, await adapter.stat(path))) throw new Error('Local file changed during sync; retry sync');
+  const actual = await adapter.stat(path);
+  if (sameStat(expected, actual)) return;
+  console.debug('[GDSync] local snapshot mismatch', { stage, path, expected: expected && { type: expected.type, size: expected.size, mtime: expected.mtime }, actual });
+  if (expected?.sha256 && actual?.type === 'file' && expected.size === actual.size) {
+    // Import lazily to avoid a module initialization cycle with readLocalChunks.
+    const { hashLocalFile } = await import('./checksum');
+    const digest = await hashLocalFile(adapter, path);
+    const after = await adapter.stat(path);
+    console.debug('[GDSync] local hash recheck', { stage, path, actual, after, matches: digest === expected.sha256 });
+    if (digest === expected.sha256 && sameStat(actual, after)) return;
+  }
+  throw new Error('Local file changed during sync; retry sync');
 }
 
 export async function* readLocalChunks(adapter: DataAdapter, path: string, chunkSize = LOCAL_READ_CHUNK_SIZE): AsyncGenerator<ArrayBuffer> {

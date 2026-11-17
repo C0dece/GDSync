@@ -102,7 +102,8 @@ export async function runSync(
   settings: GSyncSettings,
   state: SyncState,
   hooks: SyncHooks,
-  scope: SyncScope = { localPrefix: "", remotePath: settings.remoteFolder, otherPrefixes: [], readOnly: false }
+  scope: SyncScope = { localPrefix: "", remotePath: settings.remoteFolder, otherPrefixes: [], readOnly: false },
+  input?: { tree: RemoteTree; paths?: Iterable<string> },
 ): Promise<SyncResult> {
   const vault = app.vault;
   const res: SyncResult = { uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: [], errors: [], warnings: [], skipped: [], readOnlyKept: [] };
@@ -115,10 +116,15 @@ export async function runSync(
   const rules = parseExcludes(settings.excludes);
   const configDir = vault.configDir;
   const android = Platform.isAndroidApp ? new AndroidFiles(vault.adapter, configDir) : null;
-  if (android) res.warnings.push(...await android.recover());
+  if (android) {
+    hooks.transfer?.({ phase: 'recovery', path: configDir });
+    res.warnings.push(...await android.recover());
+  }
 
-  const rootId = await drive.ensureFolderPath(scope.remotePath);
-  const listed: RemoteTree = await drive.listTree(rootId);
+  hooks.transfer?.({ phase: 'folder', path: scope.remotePath });
+  const rootId = input ? undefined : await drive.ensureFolderPath(scope.remotePath);
+  hooks.transfer?.({ phase: 'listing', path: scope.remotePath });
+  const listed = input?.tree ?? await drive.listTree(rootId!);
   res.warnings.push(...listed.warnings);
   // Re-key the Drive listing by vault path, so the rest of the engine works in vault paths.
   const tree: RemoteTree = { files: new Map(), folders: new Map(), warnings: listed.warnings };
@@ -126,13 +132,21 @@ export async function runSync(
   for (const [rel, id] of listed.folders) tree.folders.set(toVault(rel), id);
 
   const local = new Map<string, TFile>();
-  for (const f of vault.getFiles()) if (inScope(f.path) && !isExcluded(f.path, rules, configDir)) local.set(f.path, f);
+  const candidates = input?.paths ? [...input.paths].map(rel => vault.getAbstractFileByPath(toVault(rel))) : vault.getFiles();
+  for (const f of candidates) if (f instanceof TFile && inScope(f.path) && !isExcluded(f.path, rules, configDir)) local.set(f.path, f);
   const remote = tree.files;
+  const verifiedUploads = new Map<string, Snapshot>();
 
   // ---- helpers ------------------------------------------------------------
   const record = async (path: string, r: RemoteFile, expected?: Snapshot) => {
-    const st = await vault.adapter.stat(path);
-    if (expected !== undefined && !sameStat(expected, st)) throw new Error("Local file changed before recording sync; retry sync");
+    expected ??= verifiedUploads.get(path);
+    verifiedUploads.delete(path);
+    let st = await vault.adapter.stat(path);
+    if (expected !== undefined && !sameStat(expected, st)) {
+      await assertLocalUnchanged(vault.adapter, path, expected, 'record');
+      st = await vault.adapter.stat(path);
+      if (!sameStat(expected, st)) await assertLocalUnchanged(vault.adapter, path, expected, 'record-final');
+    }
     if (!st) return;
     state[path] = { remoteId: r.id, remoteRev: rev(r), localMtime: st.mtime, localSize: st.size };
   };
@@ -147,6 +161,7 @@ export async function runSync(
       if (!id) {
         id = await drive.createFolder(p, parentId);
         tree.folders.set(cur, id);
+        listed.folders.set(toRemote(cur), id);
       }
       parentId = id;
     }
@@ -175,7 +190,9 @@ export async function runSync(
     if (scope.readOnly) throw new Error("Read-only folder: uploads are not allowed");
     const parentId = await ensureRemoteParent(path);
     const name = path.split("/").pop() as string;
-    return drive.createFile(name, parentId, data);
+    const created = await drive.createFile(name, parentId, data);
+    listed.files.set(toRemote(path), created);
+    return created;
   };
 
   const downloading = (path: string, remote: RemoteFile) => {
@@ -183,14 +200,21 @@ export async function runSync(
     return drive.downloadChunks(remote, (bytes, total) => hooks.transfer?.({ phase: "download", path, bytes, total }), transferChunkBytes(settings.transferChunkSizeMiB));
   };
 
-  const downloadLocal = async (path: string, remote: RemoteFile) => {
+  const androidSnapshot = (path: string) => android!.snapshot(path,
+    (bytes, total) => hooks.transfer?.({ phase: 'snapshot', path, bytes, total }));
+
+  const downloadLocal = async (path: string, remote: RemoteFile, hadLocal: boolean) => {
+    const expected = android ? await androidSnapshot(path) : await vault.adapter.stat(path);
+    if (hadLocal !== (expected?.type === 'file') || (expected && expected.type !== 'file')) {
+      throw new Error('Local file changed during sync; retry sync');
+    }
     if (!android) {
       hooks.transfer?.({ phase: "download", path });
       const data = await drive.download(remote.id);
       hooks.transfer?.({ phase: "install", path });
+      await assertLocalUnchanged(vault.adapter, path, expected, "install");
       return writeLocal(path, data);
     }
-    const expected = await vault.adapter.stat(path);
     const staged = await android.stage(downloading(path, remote));
     try {
       hooks.transfer?.({ phase: "install", path });
@@ -205,10 +229,17 @@ export async function runSync(
       hooks.transfer?.({ phase: "upload", path });
       const file = vault.getAbstractFileByPath(path);
       if (!(file instanceof TFile)) throw new Error("Local file missing");
+      const expected = await vault.adapter.stat(path);
+      if (!expected || expected.type !== "file") throw new Error("Local file missing");
       const data = await vault.readBinary(file);
-      return remoteId ? drive.updateFile(remoteId, data) : uploadNew(path, data);
+      await assertLocalUnchanged(vault.adapter, path, expected, "upload");
+      verifiedUploads.set(path, expected);
+      if (!remoteId) return uploadNew(path, data);
+      const updated = await drive.updateFile(remoteId, data);
+      listed.files.set(toRemote(path), updated);
+      return updated;
     }
-    const expected = await vault.adapter.stat(path);
+    const expected = await androidSnapshot(path);
     if (!expected) throw new Error("Local file missing");
     const target = remoteId ? { id: remoteId } : {
       name: path.split("/").pop() as string, parentId: await ensureRemoteParent(path),
@@ -217,7 +248,9 @@ export async function runSync(
     const chunkSize = transferChunkBytes(settings.transferChunkSizeMiB);
     const uploaded = await drive.uploadChunks(expected.size, android.readChunks(path, chunkSize), target,
       (bytes, total) => hooks.transfer?.({ phase: "upload", path, bytes, total }), chunkSize);
+    listed.files.set(toRemote(path), uploaded);
     await android.assertUnchanged(path, expected);
+    verifiedUploads.set(path, expected);
     return uploaded;
   };
 
@@ -244,7 +277,7 @@ export async function runSync(
       await vault.adapter.copy(path, copy);
       res.readOnlyKept.push(copy);
     }
-    await downloadLocal(path, r);
+    await downloadLocal(path, r, !!l);
     await record(path, r);
     res.downloaded++;
   };
@@ -260,7 +293,7 @@ export async function runSync(
         if (digest === r.sha256Checksum.toLowerCase()) { await record(path, r); return; }
       }
       if (lChanged) await restoreFromDrive(path, l, r);
-      else { await downloadLocal(path, r); await record(path, r); res.downloaded++; }
+      else { await downloadLocal(path, r, true); await record(path, r); res.downloaded++; }
     } else if (l && !r) {
       if (s && settings.propagateDeletes && !localChangedSince(l, s)) {
         await app.fileManager.trashFile(l); // removed in Drive -> remove here
@@ -271,7 +304,7 @@ export async function runSync(
         res.readOnlyKept.push(path); // new local file: stays on this device only
       }
     } else if (!l && r) {
-      await downloadLocal(path, r); // also restores files deleted on this device
+      await downloadLocal(path, r, false); // also restores files deleted on this device
       await record(path, r);
       res.downloaded++;
     } else {
@@ -280,7 +313,7 @@ export async function runSync(
   };
 
   const resolveBothChanged = async (path: string, l: TFile, r: RemoteFile) => {
-    const expected = await vault.adapter.stat(path);
+    const expected = android ? await androidSnapshot(path) : await vault.adapter.stat(path);
     if (!expected || expected.type !== "file") throw new Error("Local file missing during comparison");
     // Only compare files already matched by their full vault-relative path.
     // A missing/invalid checksum keeps the exact comparison fallback.
@@ -337,12 +370,15 @@ export async function runSync(
     await record(cPath, cRemote);
     hooks.transfer?.({ phase: "upload", path });
     const updated = await drive.updateFile(r.id, ld);
-    await record(path, updated);
+    listed.files.set(toRemote(path), updated);
+    await record(path, updated, expected);
     res.conflicts.push(path);
   };
 
   // ---- main pass ----------------------------------------------------------
-  const paths = Array.from(new Set([...local.keys(), ...[...remote.keys()].filter(inScope), ...Object.keys(state).filter(inScope)])).sort();
+  const paths = input?.paths
+    ? [...new Set([...input.paths].map(toVault).filter(inScope))].sort()
+    : Array.from(new Set([...local.keys(), ...[...remote.keys()].filter(inScope), ...Object.keys(state).filter(inScope)])).sort();
 
   const work = () => res.uploaded + res.downloaded + res.deletedLocal + res.deletedRemote + res.conflicts.length;
   let lastCheckpointWork = 0;
@@ -390,7 +426,7 @@ export async function runSync(
           await record(path, updated);
           res.uploaded++;
         } else if (rChanged) {
-          await downloadLocal(path, r);
+          await downloadLocal(path, r, true);
           await record(path, r);
           res.downloaded++;
         }
@@ -406,11 +442,13 @@ export async function runSync(
         }
       } else if (!l && r) {
         if (s && settings.propagateDeletes && rev(r) === s.remoteRev) {
+          if (await vault.adapter.stat(path)) throw new Error("Local file is still present; retry sync");
           await drive.trash(r.id); // deleted here -> move to Drive trash
+          listed.files.delete(toRemote(path));
           delete state[path];
           res.deletedRemote++;
         } else {
-          await downloadLocal(path, r);
+          await downloadLocal(path, r, false);
           await record(path, r);
           res.downloaded++;
         }

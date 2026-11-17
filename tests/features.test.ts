@@ -3,13 +3,31 @@ import assert from 'node:assert/strict';
 import { Platform, TFile } from 'obsidian';
 import { runSync, SyncState } from '../src/sync';
 import { configCategory, DEFAULT_CONFIG_SYNC, mergePluginLists, localPlugins, runConfigSync } from '../src/config-sync';
-import { isSharedDrivePath, withAllDrives } from '../src/drive';
+import { DriveClient, FOLDER_MIME, isSharedDrivePath, withAllDrives } from '../src/drive';
+import { buildDriveIndex, planDriveChanges } from '../src/drive-index';
 
 // These tests cover the desktop/iOS code path; Android transfers are covered in transfer.test.ts.
 (Platform as { isAndroidApp: boolean }).isAndroidApp = false;
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const dec = (b: Uint8Array | ArrayBuffer) => new TextDecoder().decode(b);
+
+test('Drive change pagination keeps the newest cursor and detects invalid cursors', async () => {
+  const pages: string[] = [];
+  (globalThis as any).requestUrlMock = async ({ url }: { url: string }) => {
+    const token = new URL(url).searchParams.get('pageToken')!;
+    pages.push(token);
+    if (token === 'expired') return { status: 410, text: '' };
+    const changes = [{ fileId: token, removed: true }];
+    return { status: 200, json: token === 'first' ? { changes, nextPageToken: 'second' } : { changes, newStartPageToken: 'next' } };
+  };
+  const drive = new DriveClient(async () => 'fake');
+  assert.deepEqual(await drive.changesSince('first'), { cursor: 'next', changes: [
+    { fileId: 'first', removed: true }, { fileId: 'second', removed: true },
+  ] });
+  assert.deepEqual(pages, ['first', 'second']);
+  assert.equal(await drive.changesSince('expired'), null);
+});
 
 /** In-memory vault with a config folder. */
 function fakeVault(initial: Record<string, string>) {
@@ -116,6 +134,46 @@ function fakeDrive(initial: Record<string, string>) {
 
 const settings = { remoteFolder: 'Notes', maxFileSizeMB: 0, excludes: '', propagateDeletes: true, transferChunkSizeMiB: 16 } as any;
 const hooks = { checkpoint: async () => {}, progress: () => {} };
+
+test('the incremental queue uploads a local edit and downloads a Drive edit without enumerating the vault', async () => {
+  const v = fakeVault({ 'local.md': 'local', 'remote.md': 'remote', 'untouched.md': 'old' });
+  const d = fakeDrive({ 'Notes/local.md': 'local', 'Notes/remote.md': 'remote', 'Notes/untouched.md': 'old' });
+  const state: SyncState = {};
+  const tree = await d.drive.listTree('Notes');
+  assert.deepEqual((await runSync(v.app as any, d.drive as any, settings, state, hooks, undefined, { tree })).errors, []);
+  const index = buildDriveIndex('scope', 'before', tree);
+  v.put('local.md', 'local edit');
+  d.edit('Notes/remote.md', 'Drive edit');
+  const remote = await d.drive.getFile(state['remote.md'].remoteId);
+  const plan = planDriveChanges(index, [{ fileId: remote.id, file: { ...remote, parents: ['Notes'] } }], ['local.md'])!;
+  v.app.vault.getFiles = () => assert.fail('incremental sync enumerated the vault');
+  d.drive.listTree = async () => assert.fail('incremental sync enumerated Drive');
+  const result = await runSync(v.app as any, d.drive as any, settings, state, hooks, undefined, { tree: plan.tree, paths: plan.affected });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.downloaded, 1);
+  assert.deepEqual(d.calls.uploads, ['Notes/local.md']);
+  assert.equal(d.text('Notes/local.md'), 'local edit');
+  assert.equal(v.text('remote.md'), 'Drive edit');
+  assert.equal(index.cursor, 'before');
+  plan.commit('after', plan.tree);
+  assert.equal(index.cursor, 'after');
+  assert.equal(index.files['local.md'].md5Checksum, state['local.md'].remoteRev);
+  assert.equal(planDriveChanges(index, [], [])!.affected.size, 0);
+});
+
+test('file moves queue the old and new paths while folder changes require a full listing', async () => {
+  const drive = fakeDrive({ 'Notes/folder/file.md': 'text' }).drive;
+  const index = buildDriveIndex('scope', 'before', await drive.listTree('Notes'));
+  const original = index.files['folder/file.md'];
+  const moved = { ...original, name: 'moved.md', parents: ['Notes'] };
+  const plan = planDriveChanges(index, [{ fileId: original.id, file: moved }], [])!;
+  assert.deepEqual([...plan.affected].sort(), ['folder/file.md', 'moved.md']);
+  assert.deepEqual([...plan.tree.files.keys()], ['moved.md']);
+  assert.equal(planDriveChanges(index, [{ fileId: 'Notes/folder', removed: true }], []), null);
+  assert.equal(planDriveChanges(index, [{
+    fileId: 'new-folder', file: { ...moved, id: 'new-folder', mimeType: FOLDER_MIME },
+  }], []), null);
+});
 
 // ---- folder pairs ----------------------------------------------------------
 

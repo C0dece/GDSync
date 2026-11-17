@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>GSync sign-in</title>
+<title>GDSync sign-in</title>
 <style>
   :root { color-scheme: light dark; --bg:#fafafa; --fg:#1d1d1f; --muted:#6b6b70; --accent:#7c3aed; }
   @media (prefers-color-scheme: dark) { :root { --bg:#1b1b1f; --fg:#f2f2f4; --muted:#a0a0a8; --accent:#a78bfa; } }
@@ -23,7 +23,7 @@
   <h1 id="title">Returning to Obsidian…</h1>
   <p id="msg">If Obsidian doesn't open by itself, tap the button below.</p>
   <a id="open" class="btn" href="#">Open Obsidian</a>
-  <p><small>This page only passes Google's one-time sign-in code to the GSync plugin on your device. It stores and sends nothing anywhere else.</small></p>
+  <p><small>This page only passes Google's one-time sign-in code to the GDSync plugin on your device. It stores and sends nothing anywhere else.</small></p>
 </main>
 <script>
 (function () {
@@ -32,8 +32,8 @@
   var title = document.getElementById("title"), msg = document.getElementById("msg"), btn = document.getElementById("open");
 
   if (!code && !error) {
-    title.textContent = "GSync sign-in";
-    msg.textContent = "Nothing to do here. Start sign-in from the GSync settings in Obsidian.";
+    title.textContent = "GDSync sign-in";
+    msg.textContent = "Nothing to do here. Start sign-in from the GDSync settings in Obsidian.";
     btn.classList.add("hidden");
     return;
   }

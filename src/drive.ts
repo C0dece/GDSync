@@ -24,6 +24,12 @@ export interface RemoteTree {
   warnings: string[];
 }
 
+export interface DriveChange {
+  fileId: string;
+  removed?: boolean;
+  file?: RemoteFile & { parents?: string[]; trashed?: boolean };
+}
+
 interface FileList {
   files: RemoteFile[];
   nextPageToken?: string;
@@ -226,7 +232,7 @@ export class DriveClient {
           if (!folders.has(path)) {
             folders.set(path, f.id);
             queue.push([path, f.id]);
-          }
+          } else warnings.push(`Duplicate folder in Drive: ${path}`);
         } else if (f.mimeType.startsWith("application/vnd.google-apps.")) {
           continue; // Google Docs/Sheets etc. can't be downloaded as files
         } else if (files.has(path)) {
@@ -237,6 +243,35 @@ export class DriveClient {
       }
     }
     return { files, folders, warnings };
+  }
+
+  async changeCursor(): Promise<string> {
+    const { startPageToken } = (await this.req(`${API}/changes/startPageToken`)).json as { startPageToken?: string };
+    if (!startPageToken) throw new Error("Missing Drive change cursor");
+    return startPageToken;
+  }
+
+  async changesSince(cursor: string): Promise<{ cursor: string; changes: DriveChange[] } | null> {
+    const changes: DriveChange[] = [];
+    let pageToken = cursor;
+    do {
+      const params = new URLSearchParams({
+        pageToken, pageSize: "1000", includeRemoved: "true",
+        fields: `nextPageToken,newStartPageToken,changes(fileId,removed,file(${FIELDS},parents,trashed))`,
+      });
+      try {
+        const page = (await this.req(`${API}/changes?${params}`)).json as {
+          nextPageToken?: string; newStartPageToken?: string; changes: DriveChange[];
+        };
+        changes.push(...page.changes);
+        if (!page.nextPageToken && page.newStartPageToken) return { cursor: page.newStartPageToken, changes };
+        pageToken = page.nextPageToken ?? "";
+      } catch (e) {
+        if (e instanceof Error && e.message.startsWith("Drive API 410:")) return null;
+        throw e;
+      }
+    } while (pageToken);
+    throw new Error("Missing next Drive change cursor");
   }
 
   downloadChunks(file: RemoteFile, onProgress?: ByteProgress, chunkSize?: number): AsyncGenerator<ArrayBuffer> {

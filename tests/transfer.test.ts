@@ -141,6 +141,23 @@ async function syncFixture(initial?: Uint8Array) {
 }
 const settings={remoteFolder:'root',maxFileSizeMB:0,excludes:'',propagateDeletes:false} as any;
 const hooks={checkpoint:async()=>{},progress:()=>{}};
+test('Android accepts metadata-only changes to the staged source during installation',async()=>{
+ const f=await syncFixture();const copy=f.adapter.copy.bind(f.adapter);
+ f.adapter.copy=async(a,b)=>{await copy(a,b);if(a.endsWith('/data'))f.adapter.times.set(a,(f.adapter.times.get(a)??0)+1);};
+ try{const state:any={};const result=await runSync({vault:f.vault} as any,f.drive as any,settings,state,hooks);assert.deepEqual(result.errors,[]);assert.equal(result.downloaded,1);assert.deepEqual(f.adapter.files.get('note.bin'),bytes);assert.ok(state['note.bin']);}finally{f.restore();}
+});
+test('Android accepts changed mtime only when the original content still matches',async()=>{
+ for(const edit of [false,true]){
+  const f=await syncFixture(new Uint8Array([1,2,3]));const stat=await f.adapter.stat('note.bin');
+  const state:any={'note.bin':{remoteId:'test',remoteRev:'old',localMtime:stat!.mtime,localSize:stat!.size}};
+  f.drive.downloadChunks=async function*(){if(edit)await f.adapter.writeBinary('note.bin',new Uint8Array([3,2,1]).buffer);else f.adapter.times.set('note.bin',stat!.mtime+1);yield bytes.buffer;};
+  try{const result=await runSync({vault:f.vault} as any,f.drive as any,settings,state,hooks);if(edit){assert.match(result.errors.join(),/Local file changed/);assert.deepEqual(f.adapter.files.get('note.bin'),new Uint8Array([3,2,1]));assert.equal(state['note.bin'].remoteRev,'old');}else{assert.deepEqual(result.errors,[]);assert.equal(result.downloaded,1);assert.deepEqual(f.adapter.files.get('note.bin'),bytes);}}finally{f.restore();}
+ }
+});
+test('a newly created destination is never overwritten by an in-flight download',async()=>{
+ const f=await syncFixture();f.drive.downloadChunks=async function*(){await f.adapter.write('note.bin','user edit');yield bytes.buffer;};
+ try{const state:any={};const result=await runSync({vault:f.vault} as any,f.drive as any,settings,state,hooks);assert.match(result.errors.join(),/Local file changed/);assert.equal(await f.adapter.read('note.bin'),'user edit');assert.deepEqual(state,{});}finally{f.restore();}
+});
 test('first sync with identical existing copy compares streams and records state',async()=>{
  const f=await syncFixture(bytes);const state:any={};
  try{const result=await runSync({vault:f.vault} as any,f.drive as any,settings,state,hooks);assert.deepEqual(result.errors,[]);assert.equal(f.uploaded.length,0);assert.equal(state['note.bin'].remoteId,'test');assert.equal(f.adapter.files.size,1);}finally{f.restore();}
@@ -412,6 +429,12 @@ test('Drive requests SHA metadata in listings and fresh file metadata',async()=>
 });
 test('hashing progress has a separate label and byte percentage',()=>{
  const progress=new SyncProgress();progress.transfer({phase:'hash',path:'a.pdf',bytes:chunkSize,total:2*chunkSize});assert.match(progress.text(),/Hashing/);assert.match(progress.text(),/50%/);
+});
+test('preparation and local snapshot phases are visible with the affected path',()=>{
+ const progress=new SyncProgress();
+ for(const [phase,label] of [['folder','Finding Drive folder'],['access','Checking Drive access'],['listing','Listing Drive files'],['recovery','Checking previous transfers'],['snapshot','Reading local file']] as const){
+  progress.transfer({phase,path:'Obsidian/Codece',bytes:0,total:10});assert.ok(progress.text().includes(label));assert.ok(progress.text().includes('Obsidian/Codece'));
+ }
 });
 import { hashLocalFile } from '../src/checksum';
 test('hashing stays at 1 MiB regardless of the transport ceiling and handles stream boundaries',async()=>{

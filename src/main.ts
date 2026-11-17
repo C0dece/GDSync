@@ -1,5 +1,5 @@
 import { SyncProgress } from "./progress";
-import { Notice, ObsidianProtocolData, Platform, Plugin } from "obsidian";
+import { Notice, ObsidianProtocolData, Platform, Plugin, TAbstractFile, TFile } from "obsidian";
 import { exchangeCode, isPendingValid, PendingAuth, prepareSignIn, PreparedSignIn, PROTOCOL_ACTION, refreshAccessToken } from "./auth";
 import { DriveClient, FolderAccess, isSharedDrivePath } from "./drive";
 import { normalizeTransferChunkSizeMiB } from "./transfer-settings";
@@ -7,6 +7,7 @@ import { cleanPath, DEFAULT_SETTINGS, GSyncSettings, GSyncSettingTab } from "./s
 import { runSync, SyncResult, SyncScope, SyncState, underPrefix } from "./sync";
 import { DEFAULT_CONFIG_SYNC, runConfigSync } from "./config-sync";
 import { GSYNC_API_VERSION, GSyncApi, GSyncFolder, TeamsExtension } from "./api";
+import { buildDriveIndex, DriveIndex, planDriveChanges } from "./drive-index";
 
 interface PluginData {
   settings?: Partial<GSyncSettings>;
@@ -18,6 +19,9 @@ interface PluginData {
   configState?: SyncState;
   syncInProgress?: boolean;
   pendingAuth?: PendingAuth | null;
+  driveIndexes?: Record<string, DriveIndex>;
+  pendingLocalPaths?: string[];
+  pendingFullSync?: boolean;
 }
 
 export default class GSyncPlugin extends Plugin {
@@ -37,6 +41,17 @@ export default class GSyncPlugin extends Plugin {
   private pendingAuth: PendingAuth | null = null;
   private prepared: PreparedSignIn | null = null;
   private autoSyncId: number | null = null;
+  private queuedSyncId: number | undefined;
+  private pendingPaths = new Set<string>();
+  private inFlightPaths: ReadonlySet<string> = new Set();
+  private inFlightFull = false;
+  private saveTail: Promise<void> = Promise.resolve();
+  private queueSaveScheduled = false;
+  private queueNeedsSave = false;
+  private rescanLocal = true;
+  private forceFull = false;
+  private layoutReady = false;
+  private driveIndexes: Record<string, DriveIndex> = {};
   private statusEl!: HTMLElement;
   private activeProgress: SyncProgress | null = null;
   private progressNotice: Notice | null = null;
@@ -83,20 +98,41 @@ export default class GSyncPlugin extends Plugin {
     this.settings.transferChunkSizeMiB = normalizeTransferChunkSizeMiB(this.settings.transferChunkSizeMiB);
     this.state = data.state ?? {};
     this.interruptedLastTime = !!data.syncInProgress;
+    this.driveIndexes = this.interruptedLastTime ? {} : data.driveIndexes ?? {};
+    this.pendingPaths = new Set(data.pendingLocalPaths ?? []);
+    this.forceFull = data.pendingFullSync === true;
     this.pendingAuth = data.pendingAuth ?? null;
     this.settings.remoteFolder = this.settings.remoteFolder.replace(/\\/g, "/");
     if (!this.settings.remoteFolder) this.settings.remoteFolder = `Obsidian/${this.app.vault.getName()}`;
 
     this.settingTab = new GSyncSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
-    this.statusEl = this.addStatusBarItem();
-    this.setStatus("GSync: idle");
+    const statusItem = this.addStatusBarItem();
+    this.statusEl = Platform.isMobile ? statusItem : statusItem.createEl("button", { attr: { type: "button", "aria-label": "Sync with Google Drive" } });
+    if (!Platform.isMobile) this.registerDomEvent(this.statusEl, "click", () => void this.sync(false));
+    this.setStatus("GDSync: idle");
 
     this.addRibbonIcon("refresh-cw", "Sync with Google Drive", () => void this.sync(false));
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.sync(false) });
 
     this.addCommand({ id: "show-sync-progress", name: "Show sync progress", callback: () => this.showSyncProgress() });
     this.register(() => this.progressNotice?.hide());
+    this.addCommand({ id: "full-sync", name: "Run full sync", callback: () => void this.sync(false, true) });
+    this.registerEvent(this.app.vault.on("create", file => { if (file instanceof TFile) this.queueLocal(file); }));
+    this.registerEvent(this.app.vault.on("modify", file => this.queueLocal(file)));
+    this.registerEvent(this.app.vault.on("delete", file => this.queueLocal(file)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.queueLocal(file, oldPath)));
+    this.registerDomEvent(window, "focus", () => {
+      if (!document.hidden) this.queueSync();
+    });
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.hidden) this.flushMobileQueue();
+      else this.queueSync();
+    });
+    this.registerDomEvent(window, "online", () => {
+      if (this.pendingPaths.size || this.forceFull) this.queueSync();
+    });
+    this.register(() => window.clearTimeout(this.queuedSyncId));
 
     // Google -> callback.html -> obsidian://gsync-auth?code=...&state=...
     this.registerObsidianProtocolHandler(PROTOCOL_ACTION, (params) => {
@@ -104,26 +140,38 @@ export default class GSyncPlugin extends Plugin {
     });
 
     this.app.workspace.onLayoutReady(() => {
+      this.layoutReady = true;
+      const resumeMobile = Platform.isMobile && this.settings.syncOnChanges &&
+        (this.pendingPaths.size > 0 || this.forceFull || (this.interruptedLastTime && this.settings.syncOnStartup));
+      if (resumeMobile) {
+        this.queueSync();
+        return;
+      }
       if (this.interruptedLastTime) {
-        new Notice("GSync: the last sync didn't finish (Obsidian closed or crashed). Auto-sync on startup was skipped. Progress was saved, so tap Sync now to resume.", 15000);
+        new Notice("GDSync: the last sync didn't finish (Obsidian closed or crashed). Auto-sync on startup was skipped. Progress was saved, so tap Sync now to resume.", 15000);
         return;
       }
       if (this.settings.syncOnStartup && this.settings.refreshToken) {
         window.setTimeout(() => void this.sync(true), 5000);
       }
     });
-    this.scheduleAutoSync();
+    this.scheduleAutoSync(false);
   }
 
-  async saveAll() {
-    await this.saveData({
+  saveAll(): Promise<void> {
+    const save = this.saveTail.then(() => this.saveData({
       settings: this.settings,
       state: this.state,
       pairStates: this.pairStates,
       configState: this.configState,
       syncInProgress: this.syncInProgress,
       pendingAuth: this.pendingAuth,
-    } satisfies PluginData);
+      driveIndexes: this.driveIndexes,
+      pendingLocalPaths: [...new Set([...this.inFlightPaths, ...this.pendingPaths])],
+      pendingFullSync: this.forceFull || this.inFlightFull,
+    } satisfies PluginData));
+    this.saveTail = save.catch(() => undefined);
+    return save;
   }
 
   /** Called when the settings tab opens, so the tap can open the browser instantly. */
@@ -139,7 +187,7 @@ export default class GSyncPlugin extends Plugin {
     try {
       this.prepared = await prepareSignIn(clientId, redirectUri, this.app.vault.getName());
     } catch (e) {
-      console.error("[gsync] could not prepare sign-in", e);
+      console.error("[gdsync] could not prepare sign-in", e);
       this.prepared = null;
     }
   }
@@ -175,10 +223,11 @@ export default class GSyncPlugin extends Plugin {
       if (params.state !== pending.state) throw new Error("Sign-in state didn't match. Tap Sign in with Google again.");
       const tokens = await exchangeCode(this.settings.clientId, this.settings.clientSecret, params.code, pending);
       this.settings.refreshToken = tokens.refreshToken;
+      this.driveIndexes = {};
       this.setAccessToken(tokens.accessToken, tokens.expiresAt);
-      new Notice("GSync: signed in to Google Drive.");
+      new Notice("GDSync: signed in to Google Drive.");
     } catch (e) {
-      new Notice(`GSync sign-in failed: ${(e as Error).message}`, 15000);
+      new Notice(`GDSync sign-in failed: ${(e as Error).message}`, 15000);
     } finally {
       this.pendingAuth = null;
       await this.saveAll();
@@ -187,6 +236,7 @@ export default class GSyncPlugin extends Plugin {
   }
 
   setAccessToken(token: string, expiresAt: number) {
+    if (!token) this.driveIndexes = {};
     this.accessToken = token;
     this.expiresAt = expiresAt;
   }
@@ -200,14 +250,61 @@ export default class GSyncPlugin extends Plugin {
     return t.accessToken;
   }
 
-  scheduleAutoSync() {
+  scheduleAutoSync(runOnEnable = true) {
     if (this.autoSyncId !== null) window.clearInterval(this.autoSyncId);
     this.autoSyncId = null;
+    if (this.settings.syncOnChanges) {
+      if (runOnEnable) this.queueSync();
+      return;
+    }
+    window.clearTimeout(this.queuedSyncId);
     const mins = this.settings.autoSyncMinutes;
     if (mins > 0) {
       this.autoSyncId = window.setInterval(() => void this.sync(true), mins * 60 * 1000);
       this.registerInterval(this.autoSyncId);
     }
+  }
+
+  private queueLocal(file: TAbstractFile, oldPath?: string) {
+    const visible = (path: string) => !underPrefix(path, this.app.vault.configDir) && !path.split("/").some(part => part.startsWith("."));
+    const paths = [file.path, oldPath].filter((path): path is string => path !== undefined && visible(path));
+    if (!paths.length) return;
+    if (file instanceof TFile) for (const path of paths) this.pendingPaths.add(path);
+    else this.forceFull = true;
+    if (Platform.isMobile && this.layoutReady && this.settings.syncOnChanges) this.persistMobileQueue();
+    if (!this.syncing) this.queueSync();
+  }
+
+  private persistMobileQueue() {
+    this.queueNeedsSave = true;
+    if (this.queueSaveScheduled) return;
+    this.queueSaveScheduled = true;
+    void (async () => {
+      try {
+        while (this.queueNeedsSave) {
+          this.queueNeedsSave = false;
+          await this.saveAll();
+        }
+      } catch (e) {
+        console.error('[gdsync] failed to save upload queue', e);
+      } finally {
+        this.queueSaveScheduled = false;
+      }
+    })();
+  }
+
+  private flushMobileQueue() {
+    if (!Platform.isMobile || !this.layoutReady || !this.settings.syncOnChanges || !this.settings.refreshToken ||
+      (!this.pendingPaths.size && !this.forceFull)) return;
+    window.clearTimeout(this.queuedSyncId);
+    if (this.syncing) this.persistMobileQueue();
+    else void this.sync(true);
+  }
+
+  private queueSync() {
+    if (!this.layoutReady || !this.settings.syncOnChanges || !this.settings.refreshToken) return;
+    window.clearTimeout(this.queuedSyncId);
+    this.queuedSyncId = window.setTimeout(() => void this.sync(true), 1500);
   }
 
   private setStatus(text: string) {
@@ -220,6 +317,12 @@ export default class GSyncPlugin extends Plugin {
     this.progressNotice = new Notice(this.activeProgress.text(), 0);
   }
 
+  updateProgressNotifications() {
+    if (this.settings.showSyncNotifications) return;
+    this.progressNotice?.hide();
+    this.progressNotice = null;
+  }
+
   private renderProgress(force = false, showNotice = false) {
     if (!this.activeProgress) return;
     const now = performance.now();
@@ -228,7 +331,7 @@ export default class GSyncPlugin extends Plugin {
     const text = this.activeProgress.text();
     this.setStatus(text.replace(/\n/g, " · "));
     if (this.progressNotice) this.progressNotice.setMessage(text);
-    else if (showNotice && Platform.isMobile) this.showSyncProgress();
+    else if (showNotice && this.settings.showSyncNotifications && Platform.isMobile) this.showSyncProgress();
   }
 
   /** Problems with the folder pairs, by pair id. A bad pair is skipped; the rest still sync. */
@@ -246,7 +349,7 @@ export default class GSyncPlugin extends Plugin {
     return problems;
   }
 
-  private async syncAllFolders(quiet: boolean): Promise<SyncResult & { needsRestart: boolean }> {
+  private async syncAllFolders(quiet: boolean, pending: Set<string>, full: boolean): Promise<SyncResult & { needsRestart: boolean }> {
     const s = this.settings;
     this.drive.resetCache();
     const total: SyncResult & { needsRestart: boolean } = {
@@ -297,11 +400,51 @@ export default class GSyncPlugin extends Plugin {
     }
 
     for (const job of jobs) {
+      let applying = false;
       try {
+        hooks.transfer({ phase: 'folder', path: job.scope.remotePath });
         const rootId = await this.drive.ensureFolderPath(job.scope.remotePath);
+        hooks.transfer({ phase: 'access', path: job.scope.remotePath });
         const access = await this.drive.folderAccess(rootId);
         this.access.set(job.id, access);
-        add(await runSync(this.app, this.drive, s, job.state(), hooks, { ...job.scope, readOnly: !access.canEdit }));
+        const scope = { ...job.scope, readOnly: !access.canEdit };
+        const state = job.state();
+        const key = JSON.stringify([rootId, scope, s.excludes, s.maxFileSizeMB, s.propagateDeletes, this.app.vault.configDir]);
+        const indexed = rootId !== "root" && !access.inSharedDrive;
+        const index = this.driveIndexes[job.id];
+        const prefix = scope.localPrefix;
+        const relative = (path: string) => prefix ? path.slice(prefix.length + 1) : path;
+        const inScope = (path: string) => underPrefix(path, prefix) && path !== prefix &&
+          !scope.otherPrefixes.some(other => underPrefix(path, other));
+        const localPaths = new Set([...pending].filter(inScope).map(relative));
+        if (this.rescanLocal && indexed && index?.key === key && !full) {
+          const files = this.app.vault.getFiles();
+          const seen = new Set(files.map(file => file.path));
+          for (const file of files) {
+            const previous = Object.prototype.hasOwnProperty.call(state, file.path) ? state[file.path] : undefined;
+            if (inScope(file.path) && (!previous || file.stat.mtime !== previous.localMtime || file.stat.size !== previous.localSize)) {
+              localPaths.add(relative(file.path));
+            }
+          }
+          for (const path of Object.keys(state)) if (inScope(path) && !seen.has(path)) localPaths.add(relative(path));
+        }
+        hooks.transfer({ phase: 'listing', path: scope.remotePath });
+        const feed = indexed && !full && index?.key === key ? await this.drive.changesSince(index.cursor) : null;
+        const delta = feed && planDriveChanges(index, feed.changes, localPaths);
+        // Capture the cursor before a full listing so later changes are replayed.
+        const cursor = delta && feed ? feed.cursor : indexed ? await this.drive.changeCursor() : undefined;
+        const tree = delta ? delta.tree : await this.drive.listTree(rootId);
+        applying = true;
+        const result = await runSync(this.app, this.drive, s, state, hooks, scope, { tree, paths: delta ? delta.affected : undefined });
+        add(result);
+        if (!cursor || result.errors.length || tree.warnings.length) {
+          delete this.driveIndexes[job.id];
+        } else if (delta) {
+          delta.commit(cursor, tree);
+        } else {
+          this.driveIndexes[job.id] = buildDriveIndex(key, cursor, tree);
+        }
+        applying = false;
         if (job.id === "main" && s.configSync.enabled) {
           if (!access.canEdit) total.warnings.push("Settings sync skipped: the whole-vault Drive folder is view-only for you.");
           else {
@@ -317,6 +460,7 @@ export default class GSyncPlugin extends Plugin {
           }
         }
       } catch (e) {
+        if (applying) delete this.driveIndexes[job.id];
         total.errors.push(`${job.scope.remotePath || "Drive folder"}: ${(e as Error).message}`);
       }
       await this.saveAll();
@@ -324,67 +468,89 @@ export default class GSyncPlugin extends Plugin {
     return total;
   }
 
-  async sync(quiet: boolean) {
+  async sync(quiet: boolean, full = false) {
     if (this.syncing) {
       if (!quiet) new Notice("Sync already running.");
       return;
     }
     const s = this.settings;
     if (!s.clientId || !s.clientSecret || !s.refreshToken) {
-      if (!quiet) new Notice("GSync: set up and sign in from the plugin settings first.");
+      if (!quiet) new Notice("GDSync: set up and sign in from the plugin settings first.");
       return;
     }
     this.syncing = true;
+    const pending = this.pendingPaths;
+    this.pendingPaths = new Set();
+    full ||= this.forceFull;
+    this.forceFull = false;
+    this.inFlightPaths = pending;
+    this.inFlightFull = full;
+    let succeeded = false;
     this.syncInProgress = true;
     this.interruptedLastTime = false;
-    await this.saveAll();
-    this.setStatus("GSync: syncing…");
-    this.activeProgress = new SyncProgress();
-    this.renderProgress(true, !quiet);
     try {
-      const r = await this.syncAllFolders(quiet);
+      this.activeProgress = new SyncProgress();
+      this.renderProgress(true, !quiet);
+      await this.saveAll();
+      const r = await this.syncAllFolders(quiet, pending, full);
+      if (!r.errors.length) {
+        this.inFlightPaths = new Set();
+        this.inFlightFull = false;
+      }
       this.syncInProgress = false;
       await this.saveAll();
+      succeeded = !r.errors.length;
+      if (succeeded) this.rescanLocal = false;
       const parts: string[] = [];
       if (r.uploaded) parts.push(`↑${r.uploaded}`);
       if (r.downloaded) parts.push(`↓${r.downloaded}`);
       if (r.deletedLocal + r.deletedRemote) parts.push(`🗑${r.deletedLocal + r.deletedRemote}`);
       if (r.conflicts.length) parts.push(`⚠ ${r.conflicts.length} conflict(s)`);
-      const summary = parts.length ? parts.join(" ") : "up to date";
-      this.setStatus(`GSync: ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} ${r.errors.length ? "⚠" : "✓"}`);
+      const summary = parts.length ? parts.join(" ") : r.errors.length ? "sync failed" : "up to date";
+      this.setStatus(`GDSync: ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} ${r.errors.length ? "⚠" : "✓"}`);
 
-      if (!quiet || parts.length || r.errors.length) new Notice(`GSync: ${summary}`);
+      if (!quiet || parts.length || r.errors.length) new Notice(`GDSync: ${summary}`);
       if (r.conflicts.length) {
         new Notice(`Both sides changed; Drive's version saved as a "(conflict …)" copy:\n${r.conflicts.slice(0, 5).join("\n")}`, 15000);
       }
       if (r.errors.length) {
-        console.error("[gsync] errors", r.errors);
+        console.error("[gdsync] errors", r.errors);
         new Notice(`${r.errors.length} file(s) failed to sync. First: ${r.errors[0]}`, 15000);
       }
       if (r.readOnlyKept.length) {
         new Notice(`${r.readOnlyKept.length} change(s) in view-only folders stayed on this device (edits are kept as "(local edit …)" copies):\n${r.readOnlyKept.slice(0, 5).join("\n")}`, 15000);
       }
       if (r.needsRestart) {
-        new Notice("GSync: settings or plugins arrived from another device. Restart Obsidian to apply them.", 0);
+        new Notice("GDSync: settings or plugins arrived from another device. Restart Obsidian to apply them.", 0);
       }
       if (r.skipped.length) {
         new Notice(`Skipped ${r.skipped.length} file(s) over ${s.maxFileSizeMB} MB:\n${r.skipped.slice(0, 5).join("\n")}`, 15000);
       }
-      if (r.warnings.length) console.warn("[gsync] warnings", r.warnings);
+      if (r.warnings.length) console.warn("[gdsync] warnings", r.warnings);
     } catch (e) {
-      this.setStatus("GSync: error");
-      console.error("[gsync]", e);
-      new Notice(`GSync failed: ${(e as Error).message}`, 15000);
+      this.setStatus("GDSync: error");
+      console.error("[gdsync]", e);
+      new Notice(`GDSync failed: ${(e as Error).message}`, 15000);
     } finally {
       this.progressNotice?.hide();
       this.progressNotice = null;
       this.activeProgress = null;
       if (this.syncInProgress) {
-        // Failed with an error (not a crash): nothing to resume-warn about.
         this.syncInProgress = false;
-        await this.saveAll();
+        await this.saveAll().catch(e => console.error('[gdsync] failed to save sync status', e));
       }
+      this.inFlightPaths = new Set();
+      this.inFlightFull = false;
       this.syncing = false;
+      if (succeeded) {
+        if (this.pendingPaths.size || this.forceFull) {
+          if (Platform.isMobile && document.hidden) this.flushMobileQueue();
+          else this.queueSync();
+        }
+      } else {
+        for (const path of pending) this.pendingPaths.add(path);
+        this.forceFull ||= full;
+      }
     }
   }
 }
