@@ -16,13 +16,16 @@ export function workspaceFormat(file: RemoteFile) {
   return Object.prototype.hasOwnProperty.call(formats, file.mimeType) ? formats[file.mimeType] : undefined;
 }
 
-export function syncFileName(file: RemoteFile): string | undefined {
+export function syncFileName(file: RemoteFile, collision = false): string | undefined {
   if (!file.name || file.name.startsWith('.')) return;
   const format = workspaceFormat(file);
   if (!format) return file.mimeType.startsWith('application/vnd.google-apps.') ? undefined : file.name;
   if (!/^[A-Za-z0-9_-]+$/.test(file.id)) return;
-  const name = file.name.toLowerCase().endsWith(format.extension)
+  const hasExtension = file.name.toLowerCase().endsWith(format.extension);
+  const name = hasExtension
     ? file.name.slice(0, -format.extension.length) : file.name;
   const safe = Array.from(name.replace(/[<>:"/\\|?*]/g, '_')).slice(0, 80).join('').trim().replace(/\.+$/, '');
-  return `${safe || 'Untitled'} (Google ${file.id})${format.extension}`;
+  const stem = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(safe) ? `_${safe}` : safe;
+  const extension = hasExtension ? file.name.slice(-format.extension.length) : format.extension;
+  return `${stem || 'Untitled'}${collision ? ` (Google ${file.id})` : ''}${extension}`;
 }

@@ -436,7 +436,7 @@ export default class GSyncPlugin extends Plugin {
         this.access.set(job.id, access);
         const scope = { ...job.scope, readOnly: !access.canEdit };
         const state = job.state();
-        const key = JSON.stringify([3, rootId, scope, s.excludes, s.maxFileSizeMB, s.propagateDeletes, this.app.vault.configDir]);
+        const key = JSON.stringify([4, rootId, scope, s.excludes, s.maxFileSizeMB, s.propagateDeletes, this.app.vault.configDir]);
         const indexed = rootId !== "root" && !access.inSharedDrive;
         const index = this.driveIndexes[job.id];
         const prefix = scope.localPrefix;

@@ -1,5 +1,5 @@
 import { FOLDER_MIME, type DriveChange, type RemoteFile, type RemoteTree } from "./drive";
-import { syncFileName } from "./workspace-files";
+import { syncFileName, workspaceFormat } from "./workspace-files";
 
 export interface DriveIndex {
   key: string;
@@ -44,7 +44,11 @@ export function planDriveChanges(index: DriveIndex, changes: DriveChange[], loca
     if (!name) continue;
     if (parents.length > 1 || /[/\\]/.test(name)) return null;
     const parent = foldersById.get(parents[0])!;
-    const path = parent ? `${parent}/${name}` : name;
+    const current = parent ? `${parent}/${name}` : name;
+    const oldParent = oldPath?.split('/').slice(0, -1).join('/');
+    // Keep an existing alternate path on ordinary edits to the same title.
+    const path = workspaceFormat(file) && oldPath !== undefined && oldParent === parent && previous?.name === file.name
+      ? oldPath : current;
     const existing = updates.get(path) ?? (Object.prototype.hasOwnProperty.call(index.files, path) ? index.files[path] : undefined);
     if (existing && existing.id !== id) return null;
     affected.add(path);

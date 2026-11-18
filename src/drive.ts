@@ -221,6 +221,7 @@ export class DriveClient {
     const files = new Map<string, RemoteFile>();
     const folders = new Map<string, string>([["", rootId]]);
     const warnings: string[] = [];
+    const workspace: [string, RemoteFile][] = [];
     const queue: [string, string][] = [["", rootId]];
     while (queue.length) {
       const [prefix, id] = queue.shift() as [string, string];
@@ -239,13 +240,27 @@ export class DriveClient {
             folders.set(path, f.id);
             queue.push([path, f.id]);
           } else warnings.push(`Duplicate folder in Drive: ${path}`);
+        } else if (workspaceFormat(f)) {
+          workspace.push([prefix, f]);
         } else if (files.has(path)) {
           warnings.push(`Duplicate name in Drive, ignoring extra copy: ${path}`);
-          if (workspaceFormat(files.get(path)!) && !workspaceFormat(f)) files.set(path, f);
         } else {
           files.set(path, f);
         }
       }
+    }
+    const taken = new Set([...files.keys(), ...folders.keys()].map(path => path.toLowerCase()));
+    workspace.sort((a, b) => a[1].id < b[1].id ? -1 : a[1].id > b[1].id ? 1 : 0);
+    for (const [prefix, file] of workspace) {
+      const at = (name: string) => prefix ? `${prefix}/${name}` : name;
+      const preferred = at(syncFileName(file)!);
+      const path = taken.has(preferred.toLowerCase()) ? at(syncFileName(file, true)!) : preferred;
+      if (taken.has(path.toLowerCase())) {
+        warnings.push(`Workspace export filename is already in use: ${path}`);
+        continue;
+      }
+      taken.add(path.toLowerCase());
+      files.set(path, file);
     }
     return { files, folders, warnings };
   }

@@ -73,7 +73,14 @@ function fakeVault(initial: Record<string, string>) {
     createBinary: async (p: string, b: ArrayBuffer) => adapter.writeBinary(p, b),
     createFolder: async () => {},
   };
-  const app = { vault, fileManager: { trashFile: async (f: { path: string }) => { data.delete(f.path); } } };
+  const app = { vault, fileManager: {
+    trashFile: async (f: { path: string }) => { data.delete(f.path); },
+    renameFile: async (f: { path: string }, path: string) => {
+      assert.ok(!data.has(path), 'must not overwrite a pre-existing note');
+      data.set(path, data.get(f.path)!);
+      data.delete(f.path);
+    },
+  } };
   const text = (p: string) => (data.has(p) ? dec(data.get(p)!.bytes) : undefined);
   return { app, data, text, put: (p: string, s: string) => put(p, enc(s)) };
 }
@@ -203,7 +210,7 @@ test('full listing and change feed agree on the projected Workspace paths and ex
     ['drawing', '.pdf', 'application/pdf'],
   ].map(([kind, extension, mimeType]) => ({
     file: { id: kind, name: 'тест' + extension, mimeType: 'application/vnd.google-apps.' + kind, modifiedTime: 'date' },
-    name: `тест (Google ${kind})${extension}`, mimeType,
+    name: `тест${extension}`, mimeType,
   }));
   (globalThis as any).requestUrlMock = async ({ url }: { url: string }) => {
     const request = new URL(url);
@@ -216,11 +223,84 @@ test('full listing and change feed agree on the projected Workspace paths and ex
   };
   const drive = new DriveClient(async () => 'fake');
   const listed = await drive.listTree('root');
-  assert.deepEqual([...listed.files.keys()], docs.map(doc => doc.name));
+  assert.deepEqual([...listed.files.keys()].sort(), docs.map(doc => doc.name).sort());
   const index = buildDriveIndex('key', 'before', { ...listed, files: new Map() });
   const delta = planDriveChanges(index, docs.map(({ file }) => ({ fileId: file.id, file: { ...file, parents: ['root'] } })), [])!;
-  assert.deepEqual([...delta.tree.files.keys()], [...listed.files.keys()]);
+  assert.deepEqual([...delta.tree.files.keys()].sort(), [...listed.files.keys()].sort());
   for (const doc of docs) assert.equal(dec(await drive.exportWorkspaceFile(doc.file)), doc.name);
+});
+
+test('real Drive files reserve their name and same-title Google Docs use a stable alternate', async () => {
+  const doc = { id: 'doc', name: 'Test', mimeType: 'application/vnd.google-apps.document', modifiedTime: 'date' };
+  const raw = { id: 'markdown', name: 'Test.md', mimeType: 'text/markdown', modifiedTime: 'date' };
+  (globalThis as any).requestUrlMock = async () => ({ status: 200, json: { files: [doc, raw] } });
+  const tree = await new DriveClient(async () => 'fake').listTree('root');
+  assert.equal(tree.files.get('Test.md')?.id, 'markdown');
+  assert.equal(tree.files.get('Test (Google doc).md')?.id, 'doc');
+  assert.deepEqual(tree.warnings, []);
+  const index = buildDriveIndex('key', 'before', tree);
+  const delta = planDriveChanges(index, [{ fileId: 'doc', file: { ...doc, parents: ['root'], version: '2' } }], [])!;
+  assert.equal(delta.tree.files.get('Test (Google doc).md')?.version, '2');
+});
+
+test('old Google export names migrate in place without uploading or re-exporting local edits', async () => {
+  const v = fakeVault({});
+  const d = fakeDrive({});
+  const doc = { id: 'native', name: 'Новая таблица', mimeType: 'application/vnd.google-apps.spreadsheet', version: '1', modifiedTime: 'date' };
+  const old = syncFileName(doc, true)!;
+  const natural = syncFileName(doc)!;
+  let listing = old;
+  let exports = 0;
+  const drive = {
+    ...d.drive,
+    listTree: async () => ({ files: new Map([[listing, { ...doc }]]), folders: new Map([['', 'Notes']]), warnings: [] }),
+    getFile: async () => ({ ...doc }),
+    exportWorkspaceFile: async () => { exports++; return enc('old export').buffer; },
+  };
+  const state: SyncState = {};
+  const sync = () => runSync(v.app as any, drive as any, settings, state, hooks);
+  assert.equal((await sync()).downloaded, 1);
+  v.put(old, 'local edit');
+  listing = natural;
+  const result = await sync();
+  assert.deepEqual(result.errors, []);
+  assert.equal(exports, 1);
+  assert.equal(v.text(old), undefined);
+  assert.equal(v.text('Новая таблица.xlsx'), 'local edit');
+  assert.equal(state[old], undefined);
+  assert.equal(state[natural].remoteId, doc.id);
+  assert.deepEqual(d.calls, { uploads: [], trashed: [] });
+});
+
+test('a separate local note keeps its name and the Google export uses an alternate path', async () => {
+  const v = fakeVault({ 'Test.md': 'my note' });
+  const d = fakeDrive({});
+  const doc = { id: 'native', name: 'Test', mimeType: 'application/vnd.google-apps.document', version: '1', modifiedTime: 'date' };
+  const tree = { files: new Map([['Test.md', doc]]), folders: new Map([['', 'Notes']]), warnings: [] };
+  const drive = { ...d.drive, getFile: async () => doc, exportWorkspaceFile: async () => enc('export').buffer };
+  const result = await runSync(v.app as any, drive as any, settings, {}, hooks, undefined, { tree, paths: ['Test.md'] });
+  assert.deepEqual(result.errors, []);
+  assert.equal(v.text('Test.md'), 'my note');
+  assert.equal(v.text('Test (Google native).md'), 'export');
+  assert.equal(d.text('Notes/Test.md'), 'my note');
+  assert.equal(tree.files.get('Test (Google native).md')?.id, doc.id);
+});
+
+test('an interrupted export rename cannot be mistaken for a deletion on Drive', async () => {
+  const v = fakeVault({ 'Test.md': 'already moved' });
+  const d = fakeDrive({});
+  const doc = { id: 'native', name: 'Test', mimeType: 'application/vnd.google-apps.document', version: '1', modifiedTime: 'date' };
+  const old = syncFileName(doc, true)!;
+  const state: SyncState = { [old]: { remoteId: doc.id, remoteRev: '1', localSize: 13, localMtime: 1, workspaceDigest: 'old' } };
+  const tree = { files: new Map([['Test.md', doc]]), folders: new Map([['', 'Notes']]), warnings: [] };
+  const drive = {
+    ...d.drive, getFile: async () => doc, exportWorkspaceFile: async () => enc('export').buffer,
+    trash: async () => assert.fail('an interrupted rename must not affect the original'),
+  };
+  const result = await runSync(v.app as any, drive as any, settings, state, hooks, undefined, { tree });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.deletedRemote, 0);
+  assert.equal(v.text('Test.md'), 'already moved');
 });
 
 test('Workspace exports preserve local edits and never change or delete the Google original', async () => {

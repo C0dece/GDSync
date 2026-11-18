@@ -7,7 +7,7 @@ import { transferChunkBytes } from "./transfer-settings";
 import { assertLocalUnchanged, sameStat, Snapshot } from "./local-files";
 import { hashLocalFile, sha256Bytes, validSha256 } from "./checksum";
 import { sameRemoteVersion } from "./remote-metadata";
-import { workspaceFormat } from "./workspace-files";
+import { syncFileName, workspaceFormat } from "./workspace-files";
 import { plainMarkdown } from "./google-docs";
 
 /** What both sides looked like the last time this path was in sync. */
@@ -141,8 +141,6 @@ export async function runSync(
   for (const [rel, id] of listed.folders) tree.folders.set(toVault(rel), id);
 
   const local = new Map<string, TFile>();
-  const candidates = input?.paths ? [...input.paths].map(rel => vault.getAbstractFileByPath(toVault(rel))) : vault.getFiles();
-  for (const f of candidates) if (f instanceof TFile && inScope(f.path) && !isExcluded(f.path, rules, configDir)) local.set(f.path, f);
   const remote = tree.files;
   const verifiedUploads = new Map<string, Snapshot>();
 
@@ -304,13 +302,13 @@ export async function runSync(
     return c;
   };
 
-  const syncWorkspace = async (path: string, remote: RemoteFile, previous?: SyncRecord) => {
+  const syncWorkspace = async (path: string, remote: RemoteFile, previous?: SyncRecord, remapped = false) => {
     const revision = remote.version ?? remote.modifiedTime;
     const before = await vault.adapter.stat(path);
     if (before && before.type !== 'file') throw new Error('Workspace export destination is a folder');
     if (maxBytes > 0 && before && before.size > maxBytes) { res.skipped.push(path); return; }
     const tracked = previous?.remoteId === remote.id && previous.workspaceDigest;
-    if (!before && tracked && previous.remoteRev === revision && settings.propagateDeletes && !scope.readOnly) {
+    if (!before && !remapped && tracked && previous.remoteRev === revision && settings.propagateDeletes && !scope.readOnly) {
       await assertLocalUnchanged(vault.adapter, path, null, 'workspace-trash');
       await drive.trash(remote.id, remote);
       listed.files.delete(toRemote(path));
@@ -523,8 +521,78 @@ export async function runSync(
   };
 
   // ---- main pass ----------------------------------------------------------
-  const paths = input?.paths
-    ? [...new Set([...input.paths].map(toVault).filter(inScope))].sort()
+  const queued = input?.paths ? new Set([...input.paths].map(toVault)) : undefined;
+  const moved = new Set<string>();
+  const blocked = new Set<string>();
+  const remapped = new Set<string>();
+  const sources = [...remote].filter(([path, file]) =>
+    workspaceFormat(file) && inScope(path) && !isExcluded(path, rules, configDir));
+  if (sources.length) {
+    const existingById = new Map<string, string[]>();
+    for (const [path, entry] of Object.entries(state)) {
+      if (!entry.workspaceDigest || !inScope(path) || isExcluded(path, rules, configDir)) continue;
+      const paths = existingById.get(entry.remoteId) ?? [];
+      paths.push(path);
+      existingById.set(entry.remoteId, paths);
+    }
+    const taken = new Set([...remote.keys(), ...tree.folders.keys()].map(path => path.toLowerCase()));
+    for (const [preferred, source] of sources) {
+      let target = preferred;
+      const tracked = (path: string) => state[path]?.remoteId === source.id && !!state[path]?.workspaceDigest;
+      try {
+        if (!tracked(target) && await vault.adapter.stat(target)) {
+          const parent = preferred.split('/').slice(0, -1).join('/');
+          const alternate = syncFileName(source, true)!;
+          target = parent ? `${parent}/${alternate}` : alternate;
+          if (taken.has(target.toLowerCase()) || (!tracked(target) && await vault.adapter.stat(target))) {
+            throw new Error('Workspace export filename is already in use');
+          }
+        }
+        if (target !== preferred) {
+          if (isExcluded(target, rules, configDir)) {
+            blocked.add(preferred);
+            continue;
+          }
+          remote.delete(preferred);
+          listed.files.delete(toRemote(preferred));
+          remote.set(target, source);
+          listed.files.set(toRemote(target), source);
+          taken.add(target.toLowerCase());
+          queued?.add(target);
+          // An interrupted rename can leave the old state at this alternate path
+          // after the file has already moved. Don't propagate its absence.
+          remapped.add(target);
+        }
+        if (tracked(target)) continue;
+        const oldPaths = existingById.get(source.id);
+        if (oldPaths?.length !== 1) continue;
+        const old = oldPaths[0];
+        if (android?.blockedPaths.has(old) || android?.blockedPaths.has(target)) {
+          throw new Error('Interrupted transfer needs recovery before renaming the export');
+        }
+        if ((await vault.adapter.stat(old))?.type !== 'file') continue;
+        await ensureLocalParent(target);
+        await assertLocalUnchanged(vault.adapter, target, null, 'workspace-rename');
+        const file = vault.getAbstractFileByPath(old);
+        if (file instanceof TFile) await app.fileManager.renameFile(file, target);
+        else await vault.adapter.rename(old, target);
+        state[target] = state[old];
+        delete state[old];
+        moved.add(old);
+        queued?.add(old);
+      } catch (e) {
+        blocked.add(preferred);
+        blocked.add(target);
+        res.errors.push(`${preferred}: ${(e as Error).message}`);
+      }
+    }
+  }
+  const candidates = queued ? [...queued].map(path => vault.getAbstractFileByPath(path)) : vault.getFiles();
+  for (const f of candidates) {
+    if (f instanceof TFile && !moved.has(f.path) && inScope(f.path) && !isExcluded(f.path, rules, configDir)) local.set(f.path, f);
+  }
+  const paths = queued
+    ? [...queued].filter(inScope).sort()
     : [...new Set([...local.keys(), ...remote.keys(), ...Object.keys(state), ...(input?.diskPaths ?? [])])].filter(inScope).sort();
 
   const work = () => res.uploaded + res.downloaded + res.deletedLocal + res.deletedRemote + res.conflicts.length;
@@ -541,7 +609,7 @@ export async function runSync(
       lastCheckpointWork = work();
       lastCheckpointAt = Date.now();
     }
-    if (isExcluded(path, rules, configDir)) continue;
+    if (blocked.has(path) || isExcluded(path, rules, configDir)) continue;
     if (android?.blockedPaths.has(path)) {
       res.errors.push(`${path}: interrupted transfer needs recovery before syncing`);
       continue;
@@ -556,7 +624,7 @@ export async function runSync(
       const r = remote.get(path);
       let s: SyncRecord | undefined = state[path];
       if (r && workspaceFormat(r)) {
-        await syncWorkspace(path, r, s);
+        await syncWorkspace(path, r, s, remapped.has(path));
         continue;
       }
       if (s?.workspaceDigest) {

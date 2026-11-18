@@ -156,7 +156,7 @@ const hooks={checkpoint:async()=>{},progress:()=>{}};
 test('Android installs Workspace exports through the bounded staging path', async () => {
  const f = await syncFixture();
  const doc = { id: 'native', name: 'note', mimeType: 'application/vnd.google-apps.document', version: '1', modifiedTime: 'date' };
- const path = 'note (Google native).md';
+ const path = 'note.md';
  const drive = {
   ...f.drive,
   listTree: async () => ({ files: new Map([[path, doc]]), folders: new Map([['', 'root']]), warnings: [] }),
@@ -176,7 +176,7 @@ test('Android installs Workspace exports through the bounded staging path', asyn
 test('Android removes an unchanged Workspace export after Drive confirms trash', async () => {
  const f = await syncFixture();
  const doc = { id: 'native', name: 'note', mimeType: 'application/vnd.google-apps.document', version: '1', modifiedTime: 'date', trashed: false };
- const path = 'note (Google native).md';
+ const path = 'note.md';
  const drive = {
   ...f.drive,
   listTree: async () => ({
