@@ -310,6 +310,14 @@ export async function runSync(
     if (before && before.type !== 'file') throw new Error('Workspace export destination is a folder');
     if (maxBytes > 0 && before && before.size > maxBytes) { res.skipped.push(path); return; }
     const tracked = previous?.remoteId === remote.id && previous.workspaceDigest;
+    if (!before && tracked && previous.remoteRev === revision && settings.propagateDeletes && !scope.readOnly) {
+      await assertLocalUnchanged(vault.adapter, path, null, 'workspace-trash');
+      await drive.trash(remote.id, remote);
+      listed.files.delete(toRemote(path));
+      delete state[path];
+      res.deletedRemote++;
+      return;
+    }
     const canWrite = settings.writeBackGoogleDocs && !scope.readOnly && remote.mimeType === 'application/vnd.google-apps.document';
     if (before && tracked && previous.remoteRev === revision) {
       if (!canWrite || (before.size === previous.localSize && before.mtime === previous.localMtime)) return;
@@ -373,6 +381,37 @@ export async function runSync(
     const saved = await vault.adapter.stat(path);
     if (!saved || saved.type !== 'file' || saved.size !== data.byteLength) throw new Error('Incomplete Workspace export');
     state[path] = { remoteId: remote.id, remoteRev: revision, localMtime: saved.mtime, localSize: saved.size, workspaceDigest: digest };
+  };
+
+  const syncMissingWorkspace = async (path: string, previous: SyncRecord) => {
+    if (!settings.propagateDeletes) return;
+    let source: RemoteFile;
+    try {
+      source = await drive.getFile(previous.remoteId);
+    } catch (e) {
+      // Drive also returns 404 when access was revoked. Missing metadata is not proof of deletion.
+      if (e instanceof Error && e.message.startsWith('Drive API 404:')) return;
+      throw e;
+    }
+    if (source.id !== previous.remoteId || !source.trashed || !workspaceFormat(source)) return; // Moved or renamed.
+    const before = await vault.adapter.stat(path);
+    if (before) {
+      if (before.type !== 'file' || before.size !== previous.localSize) {
+        res.readOnlyKept.push(path);
+        return;
+      }
+      const digest = android ? await hashLocalFile(vault.adapter, path) : sha256Bytes(await vault.adapter.readBinary(path));
+      if (digest !== previous.workspaceDigest) {
+        res.readOnlyKept.push(path);
+        return;
+      }
+      if (!(await drive.getFile(source.id)).trashed) return;
+      await assertLocalUnchanged(vault.adapter, path, before, 'workspace-local-trash');
+      const file = vault.getAbstractFileByPath(path);
+      await trashLocal({ file: file instanceof TFile ? file : undefined, stat: before });
+      res.deletedLocal++;
+    }
+    delete state[path];
   };
 
   /**
@@ -521,7 +560,10 @@ export async function runSync(
         continue;
       }
       if (s?.workspaceDigest) {
-        if (!r) continue; // Retain exported copies when the source is removed or moved.
+        if (!r) {
+          await syncMissingWorkspace(path, s);
+          continue;
+        }
         if (l) throw new Error('A regular Drive file uses this export path; move the local export to sync both');
         s = undefined;
       }

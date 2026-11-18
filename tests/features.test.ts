@@ -302,6 +302,55 @@ test('enabled plain Docs writeback records verified exports even when newline co
   assert.equal(state[path].remoteRev, '3');
 });
 
+test('Workspace deletions respect the setting, source revision and local edits', async () => {
+  for (const scenario of ['local-delete', 'drive-delete', 'local-edit', 'local-off', 'drive-off', 'competing-edit', 'read-only', 'no-access', 'moved']) {
+    const v = fakeVault({});
+    const d = fakeDrive({});
+    const doc = { id: 'native', name: 'Test', mimeType: 'application/vnd.google-apps.document', version: '1', modifiedTime: 'date', trashed: false };
+    const path = syncFileName(doc)!;
+    let cloudTrashes = 0;
+    let listed = true;
+    const drive = {
+      ...d.drive,
+      listTree: async () => ({
+        files: new Map(listed && !doc.trashed ? [[path, { ...doc }]] : []),
+        folders: new Map([['', 'Notes']]), warnings: [],
+      }),
+      getFile: async () => {
+        if (!listed && scenario === 'no-access') throw new Error('Drive API 404: File not found');
+        return { ...doc };
+      },
+      exportWorkspaceFile: async () => enc(doc.version === '1' ? 'exported' : 'new edit').buffer,
+      trash: async (id: string, expected: typeof doc) => {
+        assert.equal(id, doc.id);
+        assert.equal(expected.version, doc.version);
+        cloudTrashes++;
+        doc.trashed = true;
+      },
+    };
+    const state: SyncState = {};
+    const scope = { localPrefix: '', remotePath: 'Notes', otherPrefixes: [], readOnly: scenario === 'read-only' };
+    const sync = () => runSync(v.app as any, drive as any, { ...settings, propagateDeletes: !scenario.endsWith('-off') }, state, hooks, scope);
+    assert.equal((await sync()).downloaded, 1, scenario);
+
+    if (['local-delete', 'local-off', 'competing-edit', 'read-only'].includes(scenario)) v.data.delete(path);
+    if (['drive-delete', 'drive-off', 'local-edit'].includes(scenario)) doc.trashed = true;
+    if (scenario === 'competing-edit') doc.version = '2';
+    if (scenario === 'local-edit') v.put(path, 'my edits'); // Same size as the original export.
+    if (scenario === 'no-access' || scenario === 'moved') listed = false;
+
+    const r = await sync();
+    assert.deepEqual(r.errors, [], scenario);
+    assert.equal(cloudTrashes, scenario === 'local-delete' ? 1 : 0, scenario);
+    assert.equal(r.deletedRemote, cloudTrashes, scenario);
+    assert.equal(r.deletedLocal, scenario === 'drive-delete' ? 1 : 0, scenario);
+    const expected = scenario === 'local-edit' ? 'my edits' : scenario === 'competing-edit' ? 'new edit'
+      : ['local-delete', 'drive-delete'].includes(scenario) ? undefined : 'exported';
+    assert.equal(v.text(path), expected, scenario);
+    assert.equal(!!state[path], expected !== undefined, scenario);
+  }
+});
+
 test('regular Office and PDF files are still transferred in both directions', async () => {
   const v = fakeVault({ 'office.docx': 'binary office data' });
   const d = fakeDrive({ 'Notes/document.pdf': 'binary pdf data' });

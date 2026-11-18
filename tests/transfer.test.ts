@@ -173,6 +173,34 @@ test('Android installs Workspace exports through the bounded staging path', asyn
   assert.ok(state[path].workspaceDigest);
  } finally { f.restore(); }
 });
+test('Android removes an unchanged Workspace export after Drive confirms trash', async () => {
+ const f = await syncFixture();
+ const doc = { id: 'native', name: 'note', mimeType: 'application/vnd.google-apps.document', version: '1', modifiedTime: 'date', trashed: false };
+ const path = 'note (Google native).md';
+ const drive = {
+  ...f.drive,
+  listTree: async () => ({
+   files: new Map(doc.trashed ? [] : [[path, { ...doc }]]), folders: new Map([['', 'root']]), warnings: [],
+  }),
+  getFile: async () => ({ ...doc }),
+  exportWorkspaceFile: async () => bytes.buffer,
+ };
+ const app = {
+  vault: { ...f.vault, getAbstractFileByPath: () => Object.assign(new TFile(), { path }) },
+  fileManager: { trashFile: async (file: TFile) => f.adapter.remove(file.path) },
+ };
+ try {
+  const state: any = {};
+  const sync = () => runSync(app as any, drive as any, { ...settings, propagateDeletes: true }, state, hooks);
+  assert.equal((await sync()).downloaded, 1);
+  doc.trashed = true;
+  const result = await sync();
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.deletedLocal, 1);
+  assert.equal(await f.adapter.exists(path), false);
+  assert.equal(state[path], undefined);
+ } finally { f.restore(); }
+});
 test('Android accepts metadata-only changes to the staged source during installation',async()=>{
  const f=await syncFixture();const copy=f.adapter.copy.bind(f.adapter);
  f.adapter.copy=async(a,b)=>{await copy(a,b);if(a.endsWith('/data'))f.adapter.times.set(a,(f.adapter.times.get(a)??0)+1);};
