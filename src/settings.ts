@@ -24,6 +24,7 @@ export interface GSyncSettings {
   remoteFolder: string;
   autoSyncMinutes: number;
   syncOnChanges: boolean;
+  writeBackGoogleDocs: boolean;
   showSyncNotifications: boolean;
   syncOnStartup: boolean;
   propagateDeletes: boolean;
@@ -43,6 +44,7 @@ export const DEFAULT_SETTINGS: GSyncSettings = {
   remoteFolder: "",
   autoSyncMinutes: 10,
   syncOnChanges: false,
+  writeBackGoogleDocs: false,
   showSyncNotifications: true,
   syncOnStartup: true,
   propagateDeletes: true,
@@ -257,6 +259,14 @@ export class GSyncSettingTab extends PluginSettingTab {
         await this.plugin.saveAll();
       })
     );
+
+    new Setting(containerEl)
+      .setName("Upload edits to plain Google Docs")
+      .setDesc("Write back text edits for Google Docs with a single tab and plain text. Requires the Google Docs API in your OAuth project.")
+      .addToggle(t => t.setValue(s.writeBackGoogleDocs).onChange(async value => {
+        s.writeBackGoogleDocs = value;
+        await this.plugin.saveAll();
+      }));
 
     new Setting(containerEl)
       .setName("Sync deletions")

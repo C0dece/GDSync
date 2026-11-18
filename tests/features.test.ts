@@ -6,6 +6,7 @@ import { configCategory, DEFAULT_CONFIG_SYNC, mergePluginLists, localPlugins, ru
 import { DriveClient, FOLDER_MIME, isSharedDrivePath, withAllDrives } from '../src/drive';
 import { buildDriveIndex, planDriveChanges } from '../src/drive-index';
 import { syncFileName } from '../src/workspace-files';
+import { planPlainDocEdit } from '../src/google-docs';
 
 // These tests cover the desktop/iOS code path; Android transfers are covered in transfer.test.ts.
 (Platform as { isAndroidApp: boolean }).isAndroidApp = false;
@@ -136,6 +137,64 @@ function fakeDrive(initial: Record<string, string>) {
 const settings = { remoteFolder: 'Notes', maxFileSizeMB: 0, excludes: '', propagateDeletes: true, transferChunkSizeMiB: 16 } as any;
 const hooks = { checkpoint: async () => {}, progress: () => {} };
 
+const plainDoc = {
+  revisionId: 'docs-7',
+  tabs: [{ tabProperties: { tabId: 'main' }, documentTab: {
+    body: { content: [{ paragraph: { elements: [{ startIndex: 1, endIndex: 8, textRun: { content: 'A😀old\n' } }] } }] },
+  } }],
+};
+
+test('Google Docs edits target only the changed text and require the server revision', async () => {
+  const file = { id: 'doc', name: 'Note', mimeType: 'application/vnd.google-apps.document', version: '7', modifiedTime: 'time' };
+  let writes = 0;
+  (globalThis as any).requestUrlMock = async ({ url, method, body }: { url: string; method: string; body: string }) => {
+    if (new URL(url).hostname === 'www.googleapis.com') return { status: 200, json: file };
+    if (method === 'GET') return { status: 200, json: plainDoc };
+    writes++;
+    assert.deepEqual(JSON.parse(body), {
+      writeControl: { requiredRevisionId: 'docs-7' },
+      requests: [
+        { deleteContentRange: { range: { startIndex: 4, endIndex: 7, tabId: 'main' } } },
+        { insertText: { location: { index: 4, tabId: 'main' }, text: 'new' } },
+      ],
+    });
+    return { status: 400, text: 'Required revision is no longer current' };
+  };
+  const drive = new DriveClient(async () => 'fake');
+  await assert.rejects(drive.updatePlainGoogleDoc(file, enc('A😀old\n').buffer, enc('A😀new').buffer), /Required revision/);
+  assert.equal(writes, 1);
+  const rich = structuredClone(plainDoc);
+  Object.assign(rich.tabs[0].documentTab.body.content[0].paragraph.elements[0].textRun, { textStyle: { bold: true } });
+  assert.throws(() => planPlainDocEdit(rich, 'A😀old', 'A😀new'), /cannot be edited safely/);
+});
+
+test('a newer Drive version blocks both overwrite and trash', async () => {
+  const file = { id: 'f', name: 'Note.md', mimeType: 'text/plain', version: '7', modifiedTime: 'time' };
+  (globalThis as any).requestUrlMock = async ({ method }: { method: string }) => {
+    assert.equal(method, 'GET', 'must not send a write using stale metadata');
+    return { status: 200, json: { ...file, version: '8' } };
+  };
+  const drive = new DriveClient(async () => 'fake');
+  await assert.rejects(drive.updateFile(file.id, enc('edit').buffer, file), /changed during sync/);
+  await assert.rejects(drive.trash(file.id, file), /changed during sync/);
+});
+
+test('a late competing upload is downloaded without losing this device’s previous upload', async () => {
+  const v = fakeVault({ 'race.md': 'local upload' });
+  const d = fakeDrive({});
+  const state: SyncState = {};
+  const sync = () => runSync(v.app as any, d.drive as any, settings, state, hooks);
+  assert.equal((await sync()).uploaded, 1);
+  d.edit('Notes/race.md', 'other device');
+  const result = await sync();
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.downloaded, 1);
+  assert.equal(v.text('race.md'), 'other device');
+  const archive = [...v.data.keys()].find(path => path.startsWith('.obsidian/plugins/gsync/previous-versions/'));
+  assert.equal(v.text(archive!), 'local upload');
+  assert.equal(state['race.md'].uploadedHere, undefined);
+});
+
 test('full listing and change feed agree on the projected Workspace paths and exports', async () => {
   const docs = [
     ['document', '.md', 'text/markdown'],
@@ -211,6 +270,36 @@ test('Workspace exports preserve local edits and never change or delete the Goog
   assert.deepEqual((await sync()).errors, []);
   assert.equal(v.text(path), contents);
   assert.deepEqual(d.calls, { uploads: [], trashed: [] });
+});
+
+test('enabled plain Docs writeback records verified exports even when newline conventions differ', async () => {
+  const v = fakeVault({});
+  const d = fakeDrive({});
+  const doc = { id: 'plain', name: 'Note', mimeType: 'application/vnd.google-apps.document', version: '1', modifiedTime: 'time' };
+  const path = syncFileName(doc)!;
+  let cloud = 'old\n';
+  const drive = {
+    ...d.drive,
+    listTree: async () => ({ files: new Map([[path, { ...doc }]]), folders: new Map([['', 'Notes']]), warnings: [] }),
+    getFile: async () => ({ ...doc }),
+    exportWorkspaceFile: async () => enc(cloud).buffer,
+    updatePlainGoogleDoc: async (_doc: unknown, baseline: ArrayBuffer, edited: ArrayBuffer) => {
+      assert.equal(dec(baseline), cloud);
+      cloud = dec(edited) + '\n';
+      doc.version = String(Number(doc.version) + 1);
+    },
+  };
+  const state: SyncState = {};
+  const sync = () => runSync(v.app as any, drive as any, { ...settings, writeBackGoogleDocs: true }, state, hooks);
+  assert.equal((await sync()).downloaded, 1);
+  for (const text of ['first edit', 'second edit']) {
+    v.put(path, text);
+    const result = await sync();
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.uploaded, 1);
+    assert.equal(cloud, text + '\n');
+  }
+  assert.equal(state[path].remoteRev, '3');
 });
 
 test('regular Office and PDF files are still transferred in both directions', async () => {

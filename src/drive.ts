@@ -1,8 +1,9 @@
 import { requestUrl, RequestUrlResponse } from "obsidian";
 
 import { downloadChunks, uploadChunks, BinarySource, ByteProgress } from "./drive-transfer";
-import { DRIVE_FILE_FIELDS as FIELDS } from "./remote-metadata";
+import { DRIVE_FILE_FIELDS as FIELDS, sameRemoteVersion } from "./remote-metadata";
 import { syncFileName, workspaceFormat } from "./workspace-files";
+import { planPlainDocEdit, plainMarkdown, type GoogleDocument } from "./google-docs";
 
 const API = "https://www.googleapis.com/drive/v3";
 const UPLOAD = "https://www.googleapis.com/upload/drive/v3";
@@ -17,6 +18,7 @@ export interface RemoteFile {
   modifiedTime: string;
   size?: string;
   version?: string;
+  trashed?: boolean;
 }
 
 export interface RemoteTree {
@@ -260,7 +262,7 @@ export class DriveClient {
     do {
       const params = new URLSearchParams({
         pageToken, pageSize: "1000", includeRemoved: "true",
-        fields: `nextPageToken,newStartPageToken,changes(fileId,removed,file(${FIELDS},parents,trashed))`,
+        fields: `nextPageToken,newStartPageToken,changes(fileId,removed,file(${FIELDS},parents))`,
       });
       try {
         const page = (await this.req(`${API}/changes?${params}`)).json as {
@@ -281,16 +283,26 @@ export class DriveClient {
     return downloadChunks((url, options) => this.req(url, options), file, onProgress, chunkSize);
   }
 
-  uploadChunks(size: number, chunks: BinarySource, target: { name: string; parentId: string } | { id: string }, onProgress?: ByteProgress, chunkSize?: number): Promise<RemoteFile> {
-    return uploadChunks((url, options) => this.req(url, options), size, chunks, target, onProgress, chunkSize);
+  uploadChunks(size: number, chunks: BinarySource, target: { name: string; parentId: string } | { id: string; expected?: RemoteFile }, onProgress?: ByteProgress, chunkSize?: number): Promise<RemoteFile> {
+    const expected = 'id' in target ? target.expected : undefined;
+    const check = expected && (() => this.assertCurrent(expected));
+    return uploadChunks((url, options) => this.req(url, options), size, chunks, target, onProgress, chunkSize, check);
   }
 
   async getFile(id: string): Promise<RemoteFile> {
     return (await this.req(`${API}/files/${encodeURIComponent(id)}?fields=${FIELDS}`)).json as RemoteFile;
   }
 
-  async download(id: string): Promise<ArrayBuffer> {
+  async assertCurrent(expected: RemoteFile): Promise<void> {
+    if (!sameRemoteVersion(expected, await this.getFile(expected.id))) {
+      throw new Error("Drive file changed during sync; retry sync");
+    }
+  }
+
+  async download(id: string, expected?: RemoteFile): Promise<ArrayBuffer> {
+    if (expected) await this.assertCurrent(expected);
     const r = await this.req(`${API}/files/${id}?alt=media`);
+    if (expected) await this.assertCurrent(expected);
     return r.arrayBuffer;
   }
 
@@ -299,6 +311,17 @@ export class DriveClient {
     if (!format) throw new Error("This Google Workspace format cannot be exported");
     const url = `${API}/files/${encodeURIComponent(file.id)}/export?mimeType=${encodeURIComponent(format.mimeType)}`;
     return (await this.req(url)).arrayBuffer;
+  }
+
+  async updatePlainGoogleDoc(file: RemoteFile, baseline: ArrayBuffer, edited: ArrayBuffer): Promise<void> {
+    const url = `https://docs.googleapis.com/v1/documents/${encodeURIComponent(file.id)}`;
+    const current = await this.req(`${url}?includeTabsContent=true&suggestionsViewMode=SUGGESTIONS_INLINE`);
+    const body = planPlainDocEdit(current.json as GoogleDocument, plainMarkdown(baseline), plainMarkdown(edited));
+    if (!body.requests.length) return;
+    await this.assertCurrent(file);
+    await this.req(`${url}:batchUpdate`, {
+      method: "POST", contentType: "application/json", body: JSON.stringify(body), retry: false,
+    });
   }
 
   async createFile(name: string, parentId: string, data: ArrayBuffer): Promise<RemoteFile> {
@@ -322,21 +345,25 @@ export class DriveClient {
     return r.json as RemoteFile;
   }
 
-  async updateFile(id: string, data: ArrayBuffer): Promise<RemoteFile> {
+  async updateFile(id: string, data: ArrayBuffer, expected?: RemoteFile): Promise<RemoteFile> {
+    if (expected) await this.assertCurrent(expected);
     const r = await this.req(`${UPLOAD}/files/${id}?uploadType=media&fields=${FIELDS}`, {
       method: "PATCH",
       contentType: "application/octet-stream",
       body: data,
+      retry: !expected,
     });
     return r.json as RemoteFile;
   }
 
   /** Moves to Drive's trash (recoverable for 30 days), never hard-deletes. */
-  async trash(id: string): Promise<void> {
+  async trash(id: string, expected?: RemoteFile): Promise<void> {
+    if (expected) await this.assertCurrent(expected);
     await this.req(`${API}/files/${id}`, {
       method: "PATCH",
       contentType: "application/json",
       body: JSON.stringify({ trashed: true }),
+      retry: !expected,
     });
   }
 }

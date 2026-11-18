@@ -8,6 +8,7 @@ import { assertLocalUnchanged, sameStat, Snapshot } from "./local-files";
 import { hashLocalFile, sha256Bytes, validSha256 } from "./checksum";
 import { sameRemoteVersion } from "./remote-metadata";
 import { workspaceFormat } from "./workspace-files";
+import { plainMarkdown } from "./google-docs";
 
 /** What both sides looked like the last time this path was in sync. */
 export interface SyncRecord {
@@ -16,6 +17,8 @@ export interface SyncRecord {
   localMtime: number;
   localSize: number;
   workspaceDigest?: string;
+  workspaceRemoteDigest?: string;
+  uploadedHere?: boolean;
 }
 export type SyncState = Record<string, SyncRecord>;
 interface LocalEntry {
@@ -144,7 +147,7 @@ export async function runSync(
   const verifiedUploads = new Map<string, Snapshot>();
 
   // ---- helpers ------------------------------------------------------------
-  const record = async (path: string, r: RemoteFile, expected?: Snapshot) => {
+  const record = async (path: string, r: RemoteFile, expected?: Snapshot, uploadedHere = verifiedUploads.has(path)) => {
     expected ??= verifiedUploads.get(path);
     verifiedUploads.delete(path);
     let st = await vault.adapter.stat(path);
@@ -155,6 +158,7 @@ export async function runSync(
     }
     if (!st) return;
     state[path] = { remoteId: r.id, remoteRev: rev(r), localMtime: st.mtime, localSize: st.size };
+    if (uploadedHere) state[path].uploadedHere = true;
   };
 
   const ensureRemoteParent = async (path: string): Promise<string> => {
@@ -210,6 +214,22 @@ export async function runSync(
   const androidSnapshot = (path: string) => android!.snapshot(path,
     (bytes, total) => hooks.transfer?.({ phase: 'snapshot', path, bytes, total }));
 
+  const keepPreviousUpload = async (path: string, expected: Snapshot) => {
+    if (expected && state[path]?.uploadedHere) {
+      // Two binary uploads can pass the last revision check at the same time.
+      // Keep this device's previous upload before adopting another version.
+      const root = `${configDir}/plugins/gsync/previous-versions`;
+      if (!await vault.adapter.exists(root)) await vault.adapter.mkdir(root);
+      const folder = `${root}/${crypto.randomUUID()}`;
+      await vault.adapter.mkdir(folder);
+      const copy = `${folder}/${path.split('/').pop()!}`;
+      await vault.adapter.copy(path, copy);
+      if ((await vault.adapter.stat(copy))?.size !== expected.size) throw new Error('Incomplete backup of previous upload');
+      await assertLocalUnchanged(vault.adapter, path, expected, 'previous-upload');
+      res.warnings.push(`Previous uploaded version kept at ${copy}`);
+    }
+  };
+
   const downloadLocal = async (path: string, remote: RemoteFile, hadLocal: boolean) => {
     const expected = android ? await androidSnapshot(path) : await vault.adapter.stat(path);
     if (hadLocal !== (expected?.type === 'file') || (expected && expected.type !== 'file')) {
@@ -217,20 +237,22 @@ export async function runSync(
     }
     if (!android) {
       hooks.transfer?.({ phase: "download", path });
-      const data = await drive.download(remote.id);
+      const data = await drive.download(remote.id, remote);
       hooks.transfer?.({ phase: "install", path });
+      await keepPreviousUpload(path, expected);
       await assertLocalUnchanged(vault.adapter, path, expected, "install");
       return writeLocal(path, data, hadLocal);
     }
     const staged = await android.stage(downloading(path, remote));
     try {
       hooks.transfer?.({ phase: "install", path });
+      await keepPreviousUpload(path, expected);
       await staged.install(path, expected);
     }
     finally { await staged.dispose(); }
   };
 
-  const uploadLocal = async (path: string, remoteId?: string): Promise<RemoteFile> => {
+  const uploadLocal = async (path: string, remote?: RemoteFile): Promise<RemoteFile> => {
     if (scope.readOnly) throw new Error("Read-only folder: uploads are not allowed");
     if (!android) {
       hooks.transfer?.({ phase: "upload", path });
@@ -239,14 +261,14 @@ export async function runSync(
       const data = await readLocal(path);
       await assertLocalUnchanged(vault.adapter, path, expected, "upload");
       verifiedUploads.set(path, expected);
-      if (!remoteId) return uploadNew(path, data);
-      const updated = await drive.updateFile(remoteId, data);
+      if (!remote) return uploadNew(path, data);
+      const updated = await drive.updateFile(remote.id, data, remote);
       listed.files.set(toRemote(path), updated);
       return updated;
     }
     const expected = await androidSnapshot(path);
     if (!expected) throw new Error("Local file missing");
-    const target = remoteId ? { id: remoteId } : {
+    const target = remote ? { id: remote.id, expected: remote } : {
       name: path.split("/").pop() as string, parentId: await ensureRemoteParent(path),
     };
     await android.assertUnchanged(path, expected);
@@ -288,7 +310,35 @@ export async function runSync(
     if (before && before.type !== 'file') throw new Error('Workspace export destination is a folder');
     if (maxBytes > 0 && before && before.size > maxBytes) { res.skipped.push(path); return; }
     const tracked = previous?.remoteId === remote.id && previous.workspaceDigest;
-    if (before && tracked && previous.remoteRev === revision) return;
+    const canWrite = settings.writeBackGoogleDocs && !scope.readOnly && remote.mimeType === 'application/vnd.google-apps.document';
+    if (before && tracked && previous.remoteRev === revision) {
+      if (!canWrite || (before.size === previous.localSize && before.mtime === previous.localMtime)) return;
+      const local = await vault.adapter.readBinary(path);
+      const digest = sha256Bytes(local);
+      await assertLocalUnchanged(vault.adapter, path, before, 'google-doc-local');
+      if (digest !== tracked) {
+        const baseline = await drive.exportWorkspaceFile(remote);
+        if (sha256Bytes(baseline) !== (previous.workspaceRemoteDigest ?? tracked)) {
+          throw new Error('Google Doc changed since the last export; retry sync');
+        }
+        hooks.transfer?.({ phase: 'upload', path });
+        await drive.updatePlainGoogleDoc(remote, baseline, local);
+        const updated = await drive.getFile(remote.id);
+        const readback = await drive.exportWorkspaceFile(updated);
+        if (plainMarkdown(readback) !== plainMarkdown(local) || !sameRemoteVersion(updated, await drive.getFile(remote.id))) {
+          throw new Error('Google Doc changed during write verification; retry sync');
+        }
+        await assertLocalUnchanged(vault.adapter, path, before, 'google-doc-record');
+        listed.files.set(toRemote(path), updated);
+        state[path] = { remoteId: remote.id, remoteRev: updated.version ?? updated.modifiedTime,
+          localMtime: before.mtime, localSize: before.size, workspaceDigest: digest, workspaceRemoteDigest: sha256Bytes(readback) };
+        res.uploaded++;
+        return;
+      }
+      previous.localMtime = before.mtime;
+      previous.localSize = before.size;
+      return;
+    }
     hooks.transfer?.({ phase: 'download', path });
     if (!sameRemoteVersion(remote, await drive.getFile(remote.id))) throw new Error('Google document changed before export; retry sync');
     const data = await drive.exportWorkspaceFile(remote);
@@ -406,30 +456,30 @@ export async function runSync(
         const cRemote = await uploadLocal(cPath);
         await record(cPath, cRemote);
         await android.assertUnchanged(path, expected);
-        const updated = await uploadLocal(path, r.id);
+        const updated = await uploadLocal(path, r);
         await record(path, updated);
         res.conflicts.push(path);
         return;
       } finally { await staged.dispose(); }
     }
     hooks.transfer?.({ phase: equal === undefined ? "compare" : "download", path });
-    const [ld, rd] = await Promise.all([readLocal(path), drive.download(r.id)]);
+    const [ld, rd] = await Promise.all([readLocal(path), drive.download(r.id, r)]);
     await assertLocalUnchanged(vault.adapter, path, expected);
     if (equal === undefined && sameBytes(ld, rd)) {
       await record(path, r, expected);
       return;
     }
     // Keep both: local wins the original name, Drive's version is saved beside it.
-    const cPath = conflictPath(path);
+    const cPath = await freeCopyPath(path, "conflict");
     hooks.transfer?.({ phase: "install", path: cPath });
     await writeLocal(cPath, rd);
     hooks.transfer?.({ phase: "upload", path: cPath });
     const cRemote = await uploadNew(cPath, rd);
     await record(cPath, cRemote);
     hooks.transfer?.({ phase: "upload", path });
-    const updated = await drive.updateFile(r.id, ld);
+    const updated = await drive.updateFile(r.id, ld, r);
     listed.files.set(toRemote(path), updated);
-    await record(path, updated, expected);
+    await record(path, updated, expected, true);
     res.conflicts.push(path);
   };
 
@@ -494,7 +544,7 @@ export async function runSync(
         const rChanged = rev(r) !== s.remoteRev || r.id !== s.remoteId;
         if (lChanged && rChanged) await resolveBothChanged(path, r);
         else if (lChanged) {
-          const updated = await uploadLocal(path, r.id);
+          const updated = await uploadLocal(path, r);
           await record(path, updated);
           res.uploaded++;
         } else if (rChanged) {
@@ -515,7 +565,7 @@ export async function runSync(
       } else if (!l && r) {
         if (s && settings.propagateDeletes && rev(r) === s.remoteRev) {
           if (await vault.adapter.stat(path)) throw new Error("Local file is still present; retry sync");
-          await drive.trash(r.id); // deleted here -> move to Drive trash
+          await drive.trash(r.id, r); // deleted here -> move to Drive trash
           listed.files.delete(toRemote(path));
           delete state[path];
           res.deletedRemote++;

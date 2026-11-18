@@ -34,11 +34,13 @@ export async function* downloadChunks(req: TransferRequest, expected: RemoteFile
 
 /** A session URL is a credential: never include it or response bodies in errors. */
 export async function uploadChunks(req: TransferRequest, size: number, chunks: BinarySource,
-  target: { name: string; parentId: string } | { id: string }, onProgress?: ByteProgress, chunkSize = transferChunkBytes(undefined)): Promise<RemoteFile> {
+  target: { name: string; parentId: string } | { id: string }, onProgress?: ByteProgress, chunkSize = transferChunkBytes(undefined),
+  checkRemote?: () => Promise<void>): Promise<RemoteFile> {
   assertTransferChunkBytes(chunkSize);
   if (!Number.isSafeInteger(size) || size < 0) throw new Error('Invalid upload size');
   onProgress?.(0, size);
   const updating = 'id' in target;
+  await checkRemote?.();
   const start = await req(`https://www.googleapis.com/upload/drive/v3/files${updating ? '/' + encodeURIComponent(target.id) : ''}?uploadType=resumable&fields=${FIELDS}`, {
     method: updating ? 'PATCH' : 'POST', contentType: 'application/json',
     headers: { 'X-Upload-Content-Type': 'application/octet-stream', 'X-Upload-Content-Length': String(size) },
@@ -57,6 +59,7 @@ export async function uploadChunks(req: TransferRequest, size: number, chunks: B
     let acknowledged = offset;
     let failures = 0;
     while (!completed && (acknowledged < end || size === 0)) {
+      if (end === size) await checkRemote?.();
       let r: RequestUrlResponse;
       try {
         r = await req(location, { method: 'PUT', contentType: 'application/octet-stream',

@@ -161,6 +161,7 @@ Start a sync with any of:
 | Auto-sync every (minutes) | `10` | `0` disables auto-sync. Used when sync on changes is off. |
 | Sync on changes | Off | Queue local edits and check Drive on return. On mobile, try sending queued edits immediately when Obsidian goes to the background. |
 | Show sync progress notifications | On | Controls automatic progress popups. Errors remain visible. |
+| Upload edits to plain Google Docs | Off | Send text edits back to a single-tab Google Doc. Enable the Google Docs API in your Google Cloud OAuth project first. |
 | Sync when Obsidian starts | On | On mobile, sync on changes can resume a saved queue after interruption. |
 | Sync deletions | On | Off = files deleted on one side come back on the next sync. |
 | Max file size (MB) | `25` | Larger files are skipped and listed. `0` = no limit. Use ~10 on phones. |
@@ -235,7 +236,9 @@ GDSync remembers what each file looked like on both sides at the last sync:
 - Renames sync as a delete plus a new file.
 - Empty folders aren't synced.
 - Regular files, including Office documents, PDFs, and attachments, sync in both directions.
-- Google Docs, Sheets, Slides, Drawings, and Apps Script are imported from Drive as Markdown, XLSX, PPTX, PDF, and JSON respectively. The local filename includes the Google file ID to distinguish the export from regular files. A newer Drive version refreshes the export, saving any local edits as a separate copy. The plugin does not rewrite or trash the Google original. Google limits exports to 10 MB. Workspace types without a supported export, such as Forms or Sites, and Drive shortcuts are skipped.
+- Google Docs, Sheets, Slides, Drawings, and Apps Script are imported from Drive as Markdown, XLSX, PPTX, PDF, and JSON respectively. The local filename includes the Google file ID. Google limits exports to 10 MB. Unsupported types, such as Forms and Sites, and Drive shortcuts are skipped.
+- With **Upload edits to plain Google Docs** enabled, text changes can be written to the original Google Doc if it has one tab and the export matches its plain text. Google checks the document revision atomically. Documents with formatting, lists, tables, objects, or suggestions remain import-only. Sheets, Slides, Drawings, and Apps Script also remain import-only. If the remote export changes while you have local edits, GDSync saves those edits as a separate copy. Removing a local export never deletes the Google original.
+- Before overwriting or trashing a regular Drive file, GDSync checks that the remote version is still current. When a new remote version replaces a version uploaded by this device, GDSync keeps its previous upload in `<config dir>/plugins/gsync/previous-versions/`. Drive version checks on regular files are separate API requests, so truly simultaneous writes can still race.
 - Hidden files and folders (names starting with `.`) are never synced.
 - Sync runs only while Obsidian is open and in the foreground.
 

@@ -179,8 +179,8 @@ export async function runConfigSync(
     await adapter.writeBinary(full(rel), data);
     res.needsRestart = true;
   };
-  const upload = async (rel: string, data: ArrayBuffer, remoteId?: string): Promise<RemoteFile> =>
-    remoteId ? drive.updateFile(remoteId, data) : drive.createFile(rel.split("/").pop() as string, await remoteParent(rel), data);
+  const upload = async (rel: string, data: ArrayBuffer, remote?: RemoteFile): Promise<RemoteFile> =>
+    remote ? drive.updateFile(remote.id, data, remote) : drive.createFile(rel.split("/").pop() as string, await remoteParent(rel), data);
   const changedLocally = async (rel: string, s: SyncRecord) => {
     const st = await adapter.stat(full(rel));
     return !st || st.mtime !== s.localMtime || st.size !== s.localSize;
@@ -190,7 +190,7 @@ export async function runConfigSync(
   const syncPluginList = async (rel: string, r: RemoteFile | undefined, s: SyncRecord | undefined) => {
     const hasLocal = local.has(rel);
     const L = hasLocal ? parseIds(await adapter.read(full(rel))) : null;
-    const R = r ? parseIds(dec.decode(await drive.download(r.id))) : null;
+    const R = r ? parseIds(dec.decode(await drive.download(r.id, r))) : null;
     if (hasLocal && L === null) throw new Error("Local community-plugins.json is not valid JSON");
     const lChanged = hasLocal && (!s || (await changedLocally(rel, s)));
     const rChanged = !!r && (!s || rev(r) !== s.remoteRev || r.id !== s.remoteId);
@@ -205,7 +205,7 @@ export async function runConfigSync(
     const forDrive = mergePluginLists(merged, R ?? [], keepLocal);
     let updated = r;
     if (!R || !sameSet(R, forDrive)) {
-      updated = await upload(rel, enc.encode(JSON.stringify(forDrive, null, 2)).buffer, r?.id);
+      updated = await upload(rel, enc.encode(JSON.stringify(forDrive, null, 2)).buffer, r);
       res.uploaded++;
     } else if (fromDrive) res.downloaded++;
     if (updated) await record(rel, updated);
@@ -229,7 +229,7 @@ export async function runConfigSync(
         const rChanged = !s || rev(r) !== s.remoteRev || r.id !== s.remoteId;
         if (!s) {
           const data = await adapter.readBinary(full(rel));
-          const remoteData = await drive.download(r.id);
+          const remoteData = await drive.download(r.id, r);
           const a = new Uint8Array(data), b = new Uint8Array(remoteData);
           if (a.length !== b.length || a.some((x, i) => x !== b[i])) {
             await write(rel, remoteData); // first run: adopt the setup already in Drive
@@ -237,10 +237,11 @@ export async function runConfigSync(
           }
           await record(rel, r);
         } else if (lChanged) {
-          await record(rel, await upload(rel, await adapter.readBinary(full(rel)), r.id));
+          if (rChanged) throw new Error("Settings changed on both sides; merge them before syncing");
+          await record(rel, await upload(rel, await adapter.readBinary(full(rel)), r));
           res.uploaded++;
         } else if (rChanged) {
-          await write(rel, await drive.download(r.id));
+          await write(rel, await drive.download(r.id, r));
           await record(rel, r);
           res.downloaded++;
         }
@@ -256,7 +257,7 @@ export async function runConfigSync(
         }
       } else if (r) {
         if (s && opts.propagateDeletes && rev(r) === s.remoteRev) {
-          await drive.trash(r.id); // removed on this device
+          await drive.trash(r.id, r); // removed on this device
           delete state[rel];
           res.deleted++;
         } else {

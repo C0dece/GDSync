@@ -1,6 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DriveClient } from '../src/drive';
+test('Android detects another device before sending the final upload chunk', async () => {
+  const file = { id: 'racing', name: 'note.md', mimeType: 'text/plain', version: '1', modifiedTime: 'time' };
+  let reads = 0;
+  (globalThis as any).requestUrlMock = async ({ method }: { method: string }) => {
+    assert.notEqual(method, 'PUT', 'must not commit stale content');
+    if (method === 'PATCH') return { status: 200, headers: { location: 'https://www.googleapis.com/session' } };
+    return { status: 200, json: { ...file, version: String(++reads) } };
+  };
+  async function* chunks() { yield new Uint8Array([1]).buffer; }
+  const drive = new DriveClient(async () => 'fake');
+  await assert.rejects(drive.uploadChunks(1, chunks(), { id: file.id, expected: file }), /changed during sync/);
+});
 const chunkSize = 1024 * 1024;
 const remote = { id: 'test', name: 'large.bin', mimeType: 'application/octet-stream', size: String(chunkSize * 2 + 7), md5Checksum: 'test-md5', modifiedTime: 'time', version: '1' };
 const bytes = new Uint8Array(Number(remote.size));
