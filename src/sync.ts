@@ -56,6 +56,8 @@ export interface SyncHooks {
   checkpoint: () => Promise<void>;
   transfer?: (progress: TransferProgress) => void;
   progress: (done: number, total: number, transferred: number) => void;
+  shouldDefer?: (path: string) => boolean;
+  defer?: (path: string) => void;
 }
 
 const rev = (f: RemoteFile) => f.md5Checksum ?? f.modifiedTime;
@@ -259,9 +261,9 @@ export async function runSync(
       const data = await readLocal(path);
       await assertLocalUnchanged(vault.adapter, path, expected, "upload");
       verifiedUploads.set(path, expected);
-      if (!remote) return uploadNew(path, data);
-      const updated = await drive.updateFile(remote.id, data, remote);
+      const updated = remote ? await drive.updateFile(remote.id, data, remote) : await uploadNew(path, data);
       listed.files.set(toRemote(path), updated);
+      await rememberUpload(path, updated, expected);
       return updated;
     }
     const expected = await androidSnapshot(path);
@@ -274,6 +276,7 @@ export async function runSync(
     const uploaded = await drive.uploadChunks(expected.size, android.readChunks(path, chunkSize), target,
       (bytes, total) => hooks.transfer?.({ phase: "upload", path, bytes, total }), chunkSize);
     listed.files.set(toRemote(path), uploaded);
+    await rememberUpload(path, uploaded, expected);
     await android.assertUnchanged(path, expected);
     verifiedUploads.set(path, expected);
     return uploaded;
@@ -284,6 +287,13 @@ export async function runSync(
     return file instanceof TFile && !input?.diskPaths?.has(path)
       ? vault.readBinary(file)
       : vault.adapter.readBinary(path);
+  };
+  const rememberUpload = async (path: string, remote: RemoteFile, sent: NonNullable<Snapshot>) => {
+    state[path] = {
+      remoteId: remote.id, remoteRev: rev(remote),
+      localMtime: sent.mtime, localSize: sent.size, uploadedHere: true,
+    };
+    if (!sameStat(sent, await vault.adapter.stat(path))) await hooks.checkpoint();
   };
   const localChangedSince = (f: LocalEntry, s: SyncRecord) => f.stat.mtime !== s.localMtime || f.stat.size !== s.localSize;
   const trashLocal = (entry: LocalEntry) => {
@@ -334,10 +344,11 @@ export async function runSync(
         if (plainMarkdown(readback) !== plainMarkdown(local) || !sameRemoteVersion(updated, await drive.getFile(remote.id))) {
           throw new Error('Google Doc changed during write verification; retry sync');
         }
-        await assertLocalUnchanged(vault.adapter, path, before, 'google-doc-record');
         listed.files.set(toRemote(path), updated);
         state[path] = { remoteId: remote.id, remoteRev: updated.version ?? updated.modifiedTime,
           localMtime: before.mtime, localSize: before.size, workspaceDigest: digest, workspaceRemoteDigest: sha256Bytes(readback) };
+        if (!sameStat(before, await vault.adapter.stat(path))) await hooks.checkpoint();
+        await assertLocalUnchanged(vault.adapter, path, before, 'google-doc-record');
         res.uploaded++;
         return;
       }
@@ -516,6 +527,7 @@ export async function runSync(
     hooks.transfer?.({ phase: "upload", path });
     const updated = await drive.updateFile(r.id, ld, r);
     listed.files.set(toRemote(path), updated);
+    await rememberUpload(path, updated, expected);
     await record(path, updated, expected, true);
     res.conflicts.push(path);
   };
@@ -610,6 +622,10 @@ export async function runSync(
       lastCheckpointAt = Date.now();
     }
     if (blocked.has(path) || isExcluded(path, rules, configDir)) continue;
+    if (hooks.shouldDefer?.(path)) {
+      hooks.defer?.(path);
+      continue;
+    }
     if (android?.blockedPaths.has(path)) {
       res.errors.push(`${path}: interrupted transfer needs recovery before syncing`);
       continue;
@@ -688,6 +704,10 @@ export async function runSync(
         delete state[path]; // gone on both sides
       }
     } catch (e) {
+      if (hooks.defer && e instanceof Error && /^(Local file changed|Incomplete local file stream)/.test(e.message)) {
+        hooks.defer(path);
+        continue;
+      }
       res.errors.push(`${path}: ${(e as Error).message}`);
     }
   }

@@ -172,6 +172,8 @@ Start a sync with any of:
 
 On desktop, GDSync also watches the vault folder while Obsidian is running. Files created or edited directly on disk, including by external editors and AI tools, enter the same queue. Enable **Sync on changes** to send them automatically.
 
+Automatic sync waits for 5 seconds without edits. Each keystroke or file change restarts this pause. If typing resumes during a transfer, the latest edits remain queued. Accepted uploads are recorded against the bytes sent so the next pass does not treat this device's own previous upload as a remote conflict. Manual sync runs immediately. On mobile, hiding Obsidian still attempts to flush the queue immediately.
+
 ### More folders
 
 Each extra folder pair links one **vault folder** with one **Drive folder**:

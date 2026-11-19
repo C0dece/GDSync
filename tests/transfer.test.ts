@@ -153,6 +153,36 @@ async function syncFixture(initial?: Uint8Array) {
 }
 const settings={remoteFolder:'root',maxFileSizeMB:0,excludes:'',propagateDeletes:false} as any;
 const hooks={checkpoint:async()=>{},progress:()=>{}};
+test('Android remembers accepted bytes if typing resumes before upload acknowledgement', async () => {
+ const f = await syncFixture(new Uint8Array([1]));
+ const stat = await f.adapter.stat('note.bin');
+ const state: any = { 'note.bin': {
+  remoteId: 'test', remoteRev: remote.md5Checksum, localMtime: stat!.mtime, localSize: stat!.size,
+ } };
+ const original = f.drive.uploadChunks;
+ let edit = true;
+ f.drive.uploadChunks = async (...args) => {
+  const result = await original(...args);
+  if (edit) { edit = false; await f.adapter.writeBinary('note.bin', new Uint8Array([3,4,5]).buffer); }
+  return result;
+ };
+ const deferred: string[] = [];
+ const queuedHooks = { ...hooks, defer: (path: string) => deferred.push(path) };
+ try {
+  await f.adapter.writeBinary('note.bin', new Uint8Array([2,3]).buffer);
+  const file = f.vault.getAbstractFileByPath()!;
+  file.stat = await f.adapter.stat('note.bin');
+  const first = await runSync({ vault: f.vault } as any, f.drive as any, settings, state, queuedHooks);
+  assert.deepEqual(first.errors, []);
+  assert.deepEqual(deferred, ['note.bin']);
+  assert.equal(state['note.bin'].localSize, 2);
+  file.stat = await f.adapter.stat('note.bin');
+  const second = await runSync({ vault: f.vault } as any, f.drive as any, settings, state, queuedHooks);
+  assert.deepEqual(second.errors, []);
+  assert.deepEqual(second.conflicts, []);
+  assert.deepEqual(f.uploaded.map(upload => upload.bytes), [Buffer.from([2,3]), Buffer.from([3,4,5])]);
+ } finally { f.restore(); }
+});
 test('Android installs Workspace exports through the bounded staging path', async () => {
  const f = await syncFixture();
  const doc = { id: 'native', name: 'note', mimeType: 'application/vnd.google-apps.document', version: '1', modifiedTime: 'date' };

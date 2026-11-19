@@ -6,10 +6,13 @@ import GSyncPlugin from '../src/main';
 test('status button syncs on desktop and local edits queue one run without an interval', async () => {
   const callbacks = new Map<string, (...args: any[]) => void>();
   const scheduled = new Map<number, () => void>();
+  const delays = new Map<number, number>();
   let nextTimer = 0;
   const runtime = globalThis as any;
   runtime.window = {
-    setTimeout: (callback: () => void) => { scheduled.set(++nextTimer, callback); return nextTimer; },
+    setTimeout: (callback: () => void, delay: number) => {
+      scheduled.set(++nextTimer, callback); delays.set(nextTimer, delay); return nextTimer;
+    },
     clearTimeout: (id: number) => scheduled.delete(id),
     setInterval: () => assert.fail('event based mode started an interval'),
   };
@@ -22,7 +25,10 @@ test('status button syncs on desktop and local edits queue one run without an in
         configDir: '.obsidian', getName: () => 'Test',
         on: (event: string, callback: (...args: any[]) => void) => callbacks.set(event, callback),
       },
-      workspace: { onLayoutReady: (callback: () => void) => callback() },
+      workspace: {
+        onLayoutReady: (callback: () => void) => callback(),
+        on: (event: string, callback: (...args: any[]) => void) => callbacks.set(event, callback),
+      },
     },
     loadData: async () => ({ settings: {
       refreshToken: 'fake', syncOnChanges: true, syncOnStartup: false, showSyncNotifications: false,
@@ -46,6 +52,12 @@ test('status button syncs on desktop and local edits queue one run without an in
     callbacks.get('modify')!(file);
     callbacks.get('modify')!(file);
     assert.equal(scheduled.size, 1);
+    assert.equal(delays.get([...scheduled.keys()][0]), 5000);
+    callbacks.get('editor-change')!({}, { file });
+    assert.equal(scheduled.size, 1, 'each keystroke replaces the pending run');
+    assert.equal(delays.get([...scheduled.keys()][0]), 5000);
+    await GSyncPlugin.prototype.sync.call(plugin, true);
+    assert.equal(scheduled.size, 1, 'an automatic run during typing stays delayed');
     scheduled.values().next().value!();
     assert.deepEqual(runs, [false, true]);
     Object.assign(Platform, { isMobile: true });

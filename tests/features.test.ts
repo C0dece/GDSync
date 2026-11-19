@@ -144,6 +144,51 @@ function fakeDrive(initial: Record<string, string>) {
 const settings = { remoteFolder: 'Notes', maxFileSizeMB: 0, excludes: '', propagateDeletes: true, transferChunkSizeMiB: 16 } as any;
 const hooks = { checkpoint: async () => {}, progress: () => {} };
 
+test('typing during an accepted upload queues the next text without false conflicts', async () => {
+  for (const initialCloud of [false, true]) {
+    const v = fakeVault({ 'typing.md': 'a' });
+    const d = fakeDrive(initialCloud ? { 'Notes/typing.md': 'a' } : {});
+    const state: SyncState = {};
+    if (initialCloud) {
+      await runSync(v.app as any, d.drive as any, settings, state, hooks);
+      v.put('typing.md', 'ab');
+    }
+    const deferred: string[] = [];
+    const originalCreate = d.drive.createFile;
+    const originalUpdate = d.drive.updateFile;
+    let typeDuringUpload = true;
+    const type = () => {
+      if (typeDuringUpload) { typeDuringUpload = false; v.put('typing.md', 'abc'); }
+    };
+    d.drive.createFile = async (...args) => { const result = await originalCreate(...args); type(); return result; };
+    d.drive.updateFile = async (...args) => { const result = await originalUpdate(...args); type(); return result; };
+    const queuedHooks = { ...hooks, defer: (path: string) => deferred.push(path) };
+    const first = await runSync(v.app as any, d.drive as any, settings, state, queuedHooks);
+    assert.deepEqual(first.errors, []);
+    assert.deepEqual(first.conflicts, []);
+    assert.deepEqual(deferred, ['typing.md']);
+    const second = await runSync(v.app as any, d.drive as any, settings, state, queuedHooks);
+    assert.deepEqual(second.errors, []);
+    assert.deepEqual(second.conflicts, []);
+    assert.equal(d.text('Notes/typing.md'), 'abc');
+    assert.deepEqual([...v.data.keys()], ['typing.md']);
+  }
+});
+
+test('a file that becomes active while a sync is preparing remains queued', async () => {
+  const v = fakeVault({ 'typing.md': 'ab' });
+  const d = fakeDrive({});
+  const deferred: string[] = [];
+  const state: SyncState = {};
+  const result = await runSync(v.app as any, d.drive as any, settings, state, {
+    ...hooks, shouldDefer: () => true, defer: path => deferred.push(path),
+  });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(deferred, ['typing.md']);
+  assert.equal(d.calls.uploads.length, 0);
+  assert.deepEqual(state, {});
+});
+
 const plainDoc = {
   revisionId: 'docs-7',
   tabs: [{ tabProperties: { tabId: 'main' }, documentTab: {

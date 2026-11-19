@@ -44,6 +44,8 @@ export default class GSyncPlugin extends Plugin {
   private autoSyncId: number | null = null;
   private queuedSyncId: number | undefined;
   private pendingPaths = new Set<string>();
+  private lastLocalActivity = 0;
+  private editedPaths = new Map<string, number>();
   private inFlightPaths: ReadonlySet<string> = new Set();
   private inFlightFull = false;
   private saveTail: Promise<void> = Promise.resolve();
@@ -123,6 +125,9 @@ export default class GSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", file => this.queueLocal(file)));
     this.registerEvent(this.app.vault.on("delete", file => this.queueLocal(file)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.queueLocal(file, oldPath)));
+    this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
+      if (info.file) this.queueLocal(info.file);
+    }));
     this.registerDomEvent(window, "focus", () => {
       if (!document.hidden) this.queueSync();
     });
@@ -271,6 +276,8 @@ export default class GSyncPlugin extends Plugin {
     const visible = (path: string) => !underPrefix(path, this.app.vault.configDir) && !path.split("/").some(part => part.startsWith("."));
     const paths = [file.path, oldPath].filter((path): path is string => path !== undefined && visible(path));
     if (!paths.length) return;
+    this.lastLocalActivity = Date.now();
+    for (const path of paths) this.editedPaths.set(path, this.lastLocalActivity);
     if (file instanceof TFile) {
       for (const path of paths) this.pendingPaths.add(path);
     } else this.forceFull = true;
@@ -293,6 +300,8 @@ export default class GSyncPlugin extends Plugin {
       const close = watchVaultDisk(adapter.getBasePath(),
         path => !underPrefix(path, this.app.vault.configDir) && !path.split('/').some(part => part.startsWith('.')),
         path => {
+          this.lastLocalActivity = Date.now();
+          this.editedPaths.set(path, this.lastLocalActivity);
           this.pendingPaths.add(path);
           if (!this.syncing) this.queueSync();
         }, onError);
@@ -328,10 +337,11 @@ export default class GSyncPlugin extends Plugin {
     else void this.sync(true);
   }
 
-  private queueSync() {
-    if (!this.layoutReady || !this.settings.syncOnChanges || !this.settings.refreshToken) return;
+  private queueSync(afterActivity = false) {
+    if (!this.layoutReady || (!this.settings.syncOnChanges && !afterActivity) || !this.settings.refreshToken) return;
     window.clearTimeout(this.queuedSyncId);
-    this.queuedSyncId = window.setTimeout(() => void this.sync(true), 1500);
+    const idle = Math.max(0, 5000 - (Date.now() - this.lastLocalActivity));
+    this.queuedSyncId = window.setTimeout(() => void this.sync(true), Math.max(1500, idle));
   }
 
   private setStatus(text: string) {
@@ -392,6 +402,9 @@ export default class GSyncPlugin extends Plugin {
     };
     const hooks = {
       checkpoint: () => this.saveAll(),
+      shouldDefer: (path: string) => quiet && !(Platform.isMobile && document.hidden) &&
+        Date.now() - (this.editedPaths.get(path) ?? 0) < 5000,
+      defer: (path: string) => { this.pendingPaths.add(path); },
       progress: (done: number, count: number, transferred: number) => {
         this.activeProgress?.files(done, count);
         this.renderProgress(done === count, transferred > 0 || !quiet);
@@ -504,6 +517,10 @@ export default class GSyncPlugin extends Plugin {
       return;
     }
     const s = this.settings;
+    if (quiet && !full && !(Platform.isMobile && document.hidden) && Date.now() - this.lastLocalActivity < 5000) {
+      this.queueSync(true);
+      return;
+    }
     if (!s.clientId || !s.clientSecret || !s.refreshToken) {
       if (!quiet) new Notice("GDSync: set up and sign in from the plugin settings first.");
       return;
